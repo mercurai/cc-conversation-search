@@ -1,3 +1,27 @@
+"""Resolve and mine a Claude Code session transcript.
+
+Phase 1 (mercurai/cc-conversation-search#2): correctness work for stage-based
+session resolution and project-path normalization. The CLI surface
+(`cc-conversation-search mine-session <id> [--transcript <path>]`) is preserved.
+
+The public entry points exposed by this module are:
+
+    resolve_session(session_id, explicit_path=None) -> dict
+        Stage-based resolver. Returns stable structured metadata describing
+        each resolution stage that was attempted, what it found, and which
+        stage (if any) succeeded. Codex filename matches are recorded as
+        evidence-only and never count as resolution.
+
+    parse_transcript(path) -> dict
+        Extract a structured summary of a single transcript JSONL.
+
+    build_report(session_id, transcript=None) -> str
+        Human-readable text report. Internally delegates to resolve_session.
+
+    main(argv=None)
+        CLI entry point used by the package console script.
+"""
+
 import argparse
 import json
 import os
@@ -8,6 +32,10 @@ import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+
+# Ordered resolution stages. `codex_filename_matches` is intentionally NOT
+# present in this list — Codex-side filename matches are evidence only.
+RESOLUTION_STAGES = ("tree", "explicit", "claude_root")
 
 
 def parse_args(argv=None):
@@ -63,7 +91,105 @@ def safe_quote(value):
     return '"' + str(value).replace('"', '""') + '"'
 
 
+# ---------------------------------------------------------------------------
+# Path handling
+# ---------------------------------------------------------------------------
+
+def canonicalize_path(path_str):
+    """Canonicalize a path string. Forward and back slashes both supported,
+    `~` expanded. Returns a Path even if the file does not exist."""
+    if not path_str:
+        return None
+    try:
+        path = Path(path_str).expanduser()
+        if path.exists():
+            return path.resolve()
+        return path
+    except OSError:
+        return Path(path_str)
+
+
+def _read_jsonl_cwd(path, max_lines=200):
+    """Scan up to `max_lines` of a JSONL transcript looking for the first
+    record that carries a `cwd` field. Returns the cwd string or None.
+
+    Real Claude Code transcripts often begin with summary/compactSummary
+    records that have no `cwd`; only user/assistant message records carry
+    the working directory. Reading just the first line is not enough.
+    """
+    if not path:
+        return None
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            for i, line in enumerate(handle):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                cwd = obj.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
+def normalize_project_path(raw_value=None, transcript_path=None, encoded_dir=None):
+    """Return a best-effort original project path for a session.
+
+    Resolution order:
+      1. If transcript_path exists, read the first JSONL record and use its
+         `cwd` field. This is the authoritative source — Claude Code records
+         the working directory on every message.
+      2. Otherwise, if `raw_value` looks already-correct (contains `:` or
+         starts with `/` and does not contain the `//` artifact), return it.
+      3. Otherwise, if `encoded_dir` is provided, return it as-is. The
+         encoded directory name is lossless even though it is not pretty.
+      4. Otherwise return raw_value unchanged.
+
+    The earlier indexer used `name.replace('-', '/')` which destroys
+    information whenever the original path contained literal hyphens (e.g.
+    `D:\\projects\\claude-code-config`). We never reproduce that
+    transformation here; we either recover the truth from the transcript or
+    preserve what we have.
+    """
+    # Stage 1 — authoritative recovery from transcript
+    if transcript_path:
+        cwd = _read_jsonl_cwd(transcript_path)
+        if cwd:
+            return cwd
+
+    # Stage 2 — already-correct value
+    if isinstance(raw_value, str) and raw_value:
+        looks_degraded = "//" in raw_value and not raw_value.startswith("//")
+        looks_correct = (":" in raw_value) or raw_value.startswith("/") or raw_value.startswith("\\")
+        if looks_correct and not looks_degraded:
+            return raw_value
+
+    # Stage 3 — encoded directory name (lossless even if not pretty)
+    if isinstance(encoded_dir, str) and encoded_dir:
+        return encoded_dir
+
+    # Stage 4 — give back what we got
+    return raw_value
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 of resolution: cc-conversation-search tree
+# ---------------------------------------------------------------------------
+
 def run_cc_tree(session_id):
+    """Invoke `cc-conversation-search tree <id> --json` and classify the
+    result. Treats a JSON payload containing `"error"` as unresolved even
+    when the process exited 0.
+    """
     cli = shutil.which("cc-conversation-search")
     if not cli:
         return {
@@ -76,26 +202,34 @@ def run_cc_tree(session_id):
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
 
-    result = subprocess.run(
-        [cli, "tree", session_id, "--json"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        shell=False,
-    )
+    try:
+        result = subprocess.run(
+            [cli, "tree", session_id, "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "status": "failed",
+            "checked": ["cc-conversation-search tree"],
+            "error": f"subprocess error: {exc}",
+        }
 
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
     payload = None
-    error = None
+    parse_error = None
     if stdout:
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError:
-            error = "Non-JSON output from cc-conversation-search tree"
+            parse_error = "Non-JSON output from cc-conversation-search tree"
 
+    # Treat `"error"` in payload as unresolved regardless of exit code.
     if isinstance(payload, dict) and payload.get("error"):
         return {
             "status": "unresolved",
@@ -120,7 +254,7 @@ def run_cc_tree(session_id):
         return {
             "status": "failed",
             "checked": ["cc-conversation-search tree"],
-            "error": error or "Unexpected tree output",
+            "error": parse_error or "Unexpected tree output",
             "stdout": stdout,
             "stderr": stderr,
             "returncode": result.returncode,
@@ -136,42 +270,71 @@ def run_cc_tree(session_id):
     }
 
 
-def canonicalize_path(path_str):
-    if not path_str:
+def _extract_tree_conversation(tree_result):
+    """Pull the `conversation` block from a resolved tree response,
+    accommodating both nested and flat shapes."""
+    if not isinstance(tree_result, dict):
         return None
-    try:
-        path = Path(path_str).expanduser()
-        if path.exists():
-            return path.resolve()
-        return path
-    except OSError:
-        return Path(path_str)
+    if tree_result.get("status") != "resolved":
+        return None
+    raw_metadata = tree_result.get("metadata")
+    if not isinstance(raw_metadata, dict):
+        return None
+    conv = raw_metadata.get("conversation")
+    if isinstance(conv, dict):
+        return conv
+    # Flat shape: the metadata itself is the conversation record.
+    if "session_id" in raw_metadata or "conversation_file" in raw_metadata:
+        return raw_metadata
+    return None
 
 
-def find_transcript_candidates(session_id, explicit_path=None):
+# ---------------------------------------------------------------------------
+# Stages 2/3: explicit path and raw Claude transcript search
+# ---------------------------------------------------------------------------
+
+def find_transcript_candidates(session_id, explicit_path=None, claude_root=None, codex_roots=None):
+    """Walk the explicit path, ~/.claude/projects, and Codex-side stores.
+
+    Codex matches are returned as `codex_filename_matches` and are never
+    treated as a resolved transcript by `resolve_session`.
+
+    `claude_root` and `codex_roots` are optional injection points used by
+    tests; production callers leave them unset.
+    """
     checked = []
     resolved = []
     mentioned = []
 
+    explicit_info = {"provided": False, "path": None, "exists": False}
     if explicit_path:
+        explicit_info["provided"] = True
         explicit = canonicalize_path(explicit_path)
+        explicit_info["path"] = str(explicit) if explicit else None
         checked.append(f"explicit transcript: {explicit}")
         if explicit and explicit.is_file():
+            explicit_info["exists"] = True
             resolved.append(explicit)
 
-    claude_root = Path.home() / ".claude" / "projects"
+    if claude_root is None:
+        claude_root = Path.home() / ".claude" / "projects"
+    claude_root = Path(claude_root)
     checked.append(str(claude_root))
+    claude_matches = []
     if claude_root.exists():
         for match in claude_root.rglob(f"{session_id}.jsonl"):
             if match.is_file():
                 resolved.append(match.resolve())
+                claude_matches.append(match.resolve())
 
-    codex_roots = [
-        Path.home() / ".codex",
-        Path.home() / ".agents",
-        Path.home() / "AppData" / "Roaming" / "Codex",
-    ]
+    if codex_roots is None:
+        codex_roots = [
+            Path.home() / ".codex",
+            Path.home() / ".agents",
+            Path.home() / "AppData" / "Roaming" / "Codex",
+        ]
     for root in codex_roots:
+        root = Path(root)
         checked.append(str(root))
         if not root.exists():
             continue
@@ -183,9 +346,100 @@ def find_transcript_candidates(session_id, explicit_path=None):
     return {
         "checked": list(dict.fromkeys(checked)),
         "resolved": list(dict.fromkeys(resolved)),
+        "claude_root_matches": list(dict.fromkeys(claude_matches)),
         "codex_filename_matches": list(dict.fromkeys(mentioned)),
+        "explicit": explicit_info,
+        "claude_root": str(claude_root),
     }
 
+
+# ---------------------------------------------------------------------------
+# Public stage-based resolver
+# ---------------------------------------------------------------------------
+
+def resolve_session(session_id, explicit_path=None, claude_root=None, codex_roots=None):
+    """Run all four resolution stages and return a stable dict.
+
+    Schema:
+        {
+          "session_id": str,
+          "resolved": bool,
+          "resolved_path": str | None,
+          "resolution_stage": "tree" | "explicit" | "claude_root" | None,
+          "stages": {
+            "tree": {status, checked, error, metadata},
+            "explicit": {provided, path, exists},
+            "claude_root": {checked, matches},
+            "codex_filename_matches": [path, ...]   # evidence only
+          },
+          "tree_metadata": {...} | None,
+          "project_path": str | None,        # normalized
+          "project_path_raw": str | None,    # what tree returned
+        }
+
+    `claude_root` and `codex_roots` exist for testability.
+    """
+    tree_result = run_cc_tree(session_id)
+    candidates = find_transcript_candidates(
+        session_id, explicit_path,
+        claude_root=claude_root,
+        codex_roots=codex_roots,
+    )
+    tree_conv = _extract_tree_conversation(tree_result)
+
+    resolved_path = None
+    resolution_stage = None
+
+    if tree_conv:
+        candidate = canonicalize_path(tree_conv.get("conversation_file"))
+        if candidate and candidate.is_file():
+            resolved_path = candidate
+            resolution_stage = "tree"
+
+    if resolved_path is None and candidates["explicit"]["exists"]:
+        resolved_path = canonicalize_path(candidates["explicit"]["path"])
+        resolution_stage = "explicit"
+
+    if resolved_path is None and candidates["claude_root_matches"]:
+        resolved_path = candidates["claude_root_matches"][0]
+        resolution_stage = "claude_root"
+
+    project_path_raw = tree_conv.get("project_path") if isinstance(tree_conv, dict) else None
+    encoded_dir = resolved_path.parent.name if resolved_path else None
+    project_path = normalize_project_path(
+        raw_value=project_path_raw,
+        transcript_path=resolved_path,
+        encoded_dir=encoded_dir,
+    )
+
+    return {
+        "session_id": session_id,
+        "resolved": resolution_stage is not None,
+        "resolved_path": str(resolved_path) if resolved_path else None,
+        "resolution_stage": resolution_stage,
+        "stages": {
+            "tree": {
+                "status": tree_result.get("status"),
+                "checked": tree_result.get("checked", []),
+                "error": tree_result.get("error"),
+                "metadata": tree_conv,
+            },
+            "explicit": candidates["explicit"],
+            "claude_root": {
+                "checked": candidates["claude_root"],
+                "matches": [str(p) for p in candidates["claude_root_matches"]],
+            },
+            "codex_filename_matches": [str(p) for p in candidates["codex_filename_matches"]],
+        },
+        "tree_metadata": tree_conv,
+        "project_path": project_path,
+        "project_path_raw": project_path_raw,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Transcript parsing
+# ---------------------------------------------------------------------------
 
 def extract_user_text(message):
     content = message.get("content")
@@ -341,6 +595,10 @@ def parse_transcript(path):
     }
 
 
+# ---------------------------------------------------------------------------
+# Optional autoresearch / research-db lookups
+# ---------------------------------------------------------------------------
+
 def lookup_db(session_id, db_path):
     if not db_path.exists():
         return {"path": db_path, "status": "missing", "matches": []}
@@ -398,22 +656,14 @@ def format_counter(counter, limit=None):
     return [f"{name}: {count}" for name, count in items]
 
 
+# ---------------------------------------------------------------------------
+# Human-readable report (built from structured data)
+# ---------------------------------------------------------------------------
+
 def build_report(session_id, transcript=None):
-    tree_result = run_cc_tree(session_id)
-    transcript_search = find_transcript_candidates(session_id, transcript)
-
-    resolved_path = None
-    raw_metadata = tree_result.get("metadata") if tree_result.get("status") == "resolved" else None
-    tree_metadata = raw_metadata.get("conversation", raw_metadata) if isinstance(raw_metadata, dict) else None
-    if tree_metadata:
-        conversation_file = tree_metadata.get("conversation_file")
-        if conversation_file:
-            candidate = canonicalize_path(conversation_file)
-            if candidate and candidate.is_file():
-                resolved_path = candidate
-    if not resolved_path and transcript_search["resolved"]:
-        resolved_path = transcript_search["resolved"][0]
-
+    resolution = resolve_session(session_id, transcript)
+    resolved_path = Path(resolution["resolved_path"]) if resolution["resolved_path"] else None
+    tree_metadata = resolution["tree_metadata"]
     transcript_summary = parse_transcript(resolved_path) if resolved_path else None
     db_paths = [
         Path.home() / ".claude" / "research.db",
@@ -425,23 +675,32 @@ def build_report(session_id, transcript=None):
     lines = []
     lines.extend(["Resolution", "-" * len("Resolution")])
     lines.append(f"Session ID: {session_id}")
-    lines.append(f"cc-conversation-search status: {tree_result.get('status')}")
-    if tree_result.get("error"):
-        lines.append(f"cc-conversation-search detail: {tree_result['error']}")
+    lines.append(f"cc-conversation-search status: {resolution['stages']['tree']['status']}")
+    if resolution["stages"]["tree"].get("error"):
+        lines.append(f"cc-conversation-search detail: {resolution['stages']['tree']['error']}")
     if tree_metadata:
-        lines.append(f"Project path: {tree_metadata.get('project_path')}")
+        lines.append(f"Project path (raw): {resolution['project_path_raw']}")
+        lines.append(f"Project path (normalized): {resolution['project_path']}")
         lines.append(f"Conversation file: {tree_metadata.get('conversation_file')}")
         lines.append(f"First message: {tree_metadata.get('first_message_at')}")
         lines.append(f"Last message: {tree_metadata.get('last_message_at')}")
         lines.append(f"Message count: {tree_metadata.get('message_count')}")
         lines.append(f"Indexed at: {tree_metadata.get('indexed_at')}")
+    elif resolution["project_path"]:
+        lines.append(f"Project path (recovered): {resolution['project_path']}")
     lines.append(f"Resolved transcript: {resolved_path if resolved_path else '(not found)'}")
+    if resolution["resolution_stage"]:
+        lines.append(f"Resolution stage: {resolution['resolution_stage']}")
     lines.append("Checked locations:")
-    for item in tree_result.get("checked", []) + transcript_search["checked"]:
+    for item in resolution["stages"]["tree"]["checked"]:
         lines.append(f"- {item}")
-    if transcript_search["codex_filename_matches"]:
-        lines.append("Codex filename matches (not treated as resolution):")
-        for match in transcript_search["codex_filename_matches"][:10]:
+    if resolution["stages"]["explicit"]["provided"]:
+        lines.append(f"- explicit transcript: {resolution['stages']['explicit']['path']}"
+                     + (" (exists)" if resolution["stages"]["explicit"]["exists"] else " (missing)"))
+    lines.append(f"- {resolution['stages']['claude_root']['checked']}")
+    if resolution["stages"]["codex_filename_matches"]:
+        lines.append("Codex filename matches (evidence only, not treated as resolution):")
+        for match in resolution["stages"]["codex_filename_matches"][:10]:
             lines.append(f"- {match}")
 
     lines.extend(["", "Session Summary", "-" * len("Session Summary")])
