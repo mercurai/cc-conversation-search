@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Union
 
 from conversation_search.core.indexer import ConversationIndexer
 from conversation_search.core.search import ConversationSearch, format_timestamp
+from conversation_search.core.session_miner import build_report
 
 try:
     __version__ = version("cc-conversation-search")
@@ -360,10 +361,15 @@ def cmd_resume(args):
     print(f"{CLAUDE_CMD} --resume {session_id}")
 
 
+def cmd_mine_session(args):
+    """Resolve and mine a Claude Code session transcript"""
+    print(build_report(args.session_id, args.transcript))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='cc-conversation-search',
-        description='Find and resume Claude Code conversations using semantic search'
+        description='Find, resume, and mine Claude Code conversations'
     )
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
@@ -429,6 +435,12 @@ def main():
     resume_parser = subparsers.add_parser('resume', help='Get session resumption commands')
     resume_parser.add_argument('uuid', help='Message UUID')
     resume_parser.set_defaults(func=cmd_resume)
+
+    # mine-session command
+    mine_parser = subparsers.add_parser('mine-session', help='Resolve and mine a Claude Code session transcript')
+    mine_parser.add_argument('session_id', help='Claude Code session ID')
+    mine_parser.add_argument('--transcript', help='Explicit transcript path')
+    mine_parser.set_defaults(func=cmd_mine_session)
 
     args = parser.parse_args()
 

@@ -1,0 +1,41 @@
+{
+  "name": "cc-conversation-search",
+  "version": "0.5.4",
+  "description": "Codex adapter for Mercurai's cc-conversation-search fork with Claude session mining and transcript fallbacks.",
+  "author": {
+    "name": "mercurai",
+    "url": "https://github.com/mercurai"
+  },
+  "homepage": "https://github.com/mercurai/cc-conversation-search",
+  "repository": "https://github.com/mercurai/cc-conversation-search",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "conversation-search",
+    "transcripts",
+    "session-mining"
+  ],
+  "skills": "./codex-skills/",
+  "interface": {
+    "displayName": "Claude Conversation Search",
+    "shortDescription": "Find, inspect, and mine Claude Code sessions from Codex.",
+    "longDescription": "Uses Mercurai's cc-conversation-search fork for search and session resolution, then falls back to direct transcript mining and local autoresearch correlation.",
+    "developerName": "mercurai",
+    "category": "Productivity",
+    "capabilities": [
+      "Search",
+      "Analyze",
+      "Read"
+    ],
+    "websiteURL": "https://github.com/mercurai/cc-conversation-search",
+    "privacyPolicyURL": "",
+    "termsOfServiceURL": "",
+    "defaultPrompt": [
+      "Mine this Claude Code session ID for workflow failures, tool calls, lessons, and config changes.",
+      "Find the Claude Code session where we discussed autoresearch and summarize the decisions.",
+      "Search recent Claude Code conversations for prior work on this bug before implementing a fix."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

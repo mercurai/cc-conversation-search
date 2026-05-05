@@ -1,6 +1,6 @@
 # Conversation Search
 
-Find and resume past Claude Code conversations using smart hybrid extraction and JIT indexing. Get session IDs and project paths to easily jump back into previous work.
+Find, resume, and mine past Claude Code conversations using smart hybrid extraction, JIT indexing, and transcript fallback mining. Get session IDs and project paths to easily jump back into previous work.
 
 ## Features
 
@@ -14,11 +14,13 @@ Find and resume past Claude Code conversations using smart hybrid extraction and
 - **Progressive Exploration**: Simple search → broader search → manual exploration
 - **Conversation Context**: Expand context incrementally around any message
 - **Claude Code Skill**: Integrated Skill that outputs session resumption commands
+- **Codex Plugin Adapter**: Includes a Codex plugin with a session-mining skill
+- **Transcript Mining**: Mine a session by ID or transcript path with autoresearch correlation
 - **Multi-Project Support**: Works across all your Claude Code projects
 
 ## Quick Start
 
-### Installation via Claude Code Plugin (Recommended)
+### Installation via Claude Code Plugin
 
 Install the complete plugin (skill + CLI tool instructions) directly in Claude Code:
 
@@ -33,6 +35,21 @@ Install the complete plugin (skill + CLI tool instructions) directly in Claude C
 Then follow the installation instructions shown by Claude to:
 1. Install the CLI tool: `uv tool install cc-conversation-search`
 2. Initialize the database: `cc-conversation-search init`
+
+### Installation via Codex Plugin
+
+Install the Mercurai fork locally for Codex:
+
+```bash
+git clone https://github.com/mercurai/cc-conversation-search.git "$HOME/plugins/cc-conversation-search"
+"$HOME/plugins/cc-conversation-search/install.sh"
+```
+
+This will:
+
+1. install the Mercurai fork into the `uv` tool environment
+2. register the Codex plugin in `~/.agents/plugins/marketplace.json`
+3. keep the canonical local plugin path at `~/plugins/cc-conversation-search`
 
 ### Manual Installation
 
@@ -144,6 +161,12 @@ Get context around a specific message
 cc-conversation-search context MESSAGE_UUID [--depth 5] [--content] [--json]
 ```
 
+### `cc-conversation-search mine-session`
+Resolve and mine a Claude Code session transcript
+```bash
+cc-conversation-search mine-session SESSION_ID [--transcript PATH]
+```
+
 ### `cc-conversation-search list`
 List recent conversations with calendar date support
 ```bash
@@ -169,7 +192,11 @@ cc-conversation-search tree SESSION_ID [--json]
 │   └── {project}/
 │       └── {session}.jsonl
 └── skills/
-    └── conversation-search/  # Optional Skill
+    └── conversation-search/  # Optional Claude skill
+
+~/.agents/
+└── plugins/
+    └── marketplace.json      # Optional Codex plugin registration
 
 ~/.conversation-search/
 └── index.db           # SQLite database with indexed conversations
