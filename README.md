@@ -124,6 +124,57 @@ Once installed, ask Claude:
 
 Claude will show you the session ID, project path, and exact commands to resume the conversation.
 
+## Installing, upgrading, recovering
+
+There are three independent install layers; updating one does not update the others.
+
+| Layer | What lives here | How to refresh |
+|---|---|---|
+| **Repo checkout** | Source tree at `~/plugins/cc-conversation-search/` (the path `install.sh` clones into) | `git -C ~/plugins/cc-conversation-search pull` |
+| **Installed CLI** | `cc-conversation-search` on PATH — a `uv tool` venv built from this fork | `bash install.sh` from a repo checkout (runs `uv tool install --force <repo-path>` internally) |
+| **Plugin registration** | Claude Code's plugin index for the `conversation-search` skill | `/plugin update conversation-search` inside Claude Code |
+
+`git pull` will not change which version `cc-conversation-search --version` reports. `/plugin update conversation-search` will not change it either. Only `bash install.sh` (or running `uv tool install --force <repo-path>` directly) refreshes the installed CLI from this fork. Do **not** run `uv tool upgrade cc-conversation-search` — that command re-resolves from PyPI and would replace the mercurai build with the upstream package.
+
+### Fresh install from a repo checkout
+
+```bash
+git clone https://github.com/mercurai/cc-conversation-search ~/plugins/cc-conversation-search
+cd ~/plugins/cc-conversation-search
+bash install.sh
+```
+
+`install.sh` clones / updates the repo, runs `uv tool install --force`, writes the marketplace entry, and verifies the result with `cc-conversation-search --version`. It supports two non-mutating modes for inspecting the planned actions before running them:
+
+```bash
+bash install.sh --dry-run                       # print actions, do not execute
+INSTALL_FORCE_STALE=1 bash install.sh --dry-run # also exercise the recovery branch
+```
+
+### Stale-launcher recovery
+
+The most common failure mode is a `cc-conversation-search` launcher left over from a removed `uv tool` venv: the binary exists on PATH but `cc-conversation-search --version` fails or `uv tool list` does not list it. `install.sh`'s pre-flight detects this and runs the recovery sequence below automatically. To repair manually:
+
+**Windows (Git Bash):**
+
+```bash
+uv tool uninstall cc-conversation-search 2>/dev/null || true
+rm -f "$HOME/.local/bin/cc-conversation-search.exe"
+bash ~/plugins/cc-conversation-search/install.sh
+```
+
+**Linux / macOS:**
+
+```bash
+uv tool uninstall cc-conversation-search 2>/dev/null || true
+rm -f "$HOME/.local/bin/cc-conversation-search"
+bash ~/plugins/cc-conversation-search/install.sh
+```
+
+The trailing `|| true` matters: in the stale state, `uv tool list` does not claim the tool, so `uv tool uninstall` exits non-zero — that is expected and must not abort the recovery before the launcher file is removed.
+
+A foreign installation (e.g. `pip --user`, brew) shadowing the uv launcher is a different failure: `cc-conversation-search` resolves to a path `uv tool list` does not own. In that case `install.sh` aborts pre-flight with a message naming the offending path; remove that installation and re-run.
+
 ## Command Reference
 
 ### `cc-conversation-search init`

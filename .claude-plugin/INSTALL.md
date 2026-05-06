@@ -23,7 +23,7 @@ pip install cc-conversation-search
 Create the search index for your conversation history:
 
 ```bash
-conversation-search init
+cc-conversation-search init
 ```
 
 This will:
@@ -36,7 +36,7 @@ This will:
 Verify everything is working:
 
 ```bash
-conversation-search search "test" --json
+cc-conversation-search search "test" --json
 ```
 
 ## You're Ready!
@@ -52,13 +52,46 @@ Claude will use a progressive search strategy to find specific message UUIDs you
 ## Troubleshooting
 
 **Tool not found:**
-- Make sure `conversation-search` is in your PATH
-- Try: `which conversation-search`
+- Make sure `cc-conversation-search` is in your PATH
+- Try: `which cc-conversation-search`
 
 **No conversations found:**
 - Verify `~/.claude/projects/` exists and contains .jsonl files
-- Try: `conversation-search list --days 30`
+- Try: `cc-conversation-search list --days 30`
+
+**Stale launcher (CLI on PATH but broken):**
+
+If `cc-conversation-search` is on your PATH but fails, the launcher may be
+left over from a removed `uv tool` environment. Repair on Windows Git Bash:
+
+```bash
+uv tool uninstall cc-conversation-search 2>/dev/null || true
+rm -f "$HOME/.local/bin/cc-conversation-search.exe"
+bash ~/plugins/cc-conversation-search/install.sh
+```
+
+On Linux/macOS, drop the `.exe`:
+
+```bash
+uv tool uninstall cc-conversation-search 2>/dev/null || true
+rm -f "$HOME/.local/bin/cc-conversation-search"
+bash ~/plugins/cc-conversation-search/install.sh
+```
+
+The `|| true` matters: in the stale state, `uv tool list` does not claim
+the tool, so `uv tool uninstall` exits non-zero — that is expected and must
+not abort the recovery before the launcher file is removed.
+
+If you do not yet have a repo checkout, clone it first:
+
+```bash
+git clone https://github.com/mercurai/cc-conversation-search ~/plugins/cc-conversation-search
+bash ~/plugins/cc-conversation-search/install.sh
+```
+
+Do not run `uv tool upgrade cc-conversation-search` — that re-resolves from
+PyPI and would replace this mercurai build with the upstream package.
 
 **For help:**
-- Documentation: https://github.com/akatz-ai/cc-conversation-search
-- Issues: https://github.com/akatz-ai/cc-conversation-search/issues
+- Documentation: https://github.com/mercurai/cc-conversation-search
+- Issues: https://github.com/mercurai/cc-conversation-search/issues

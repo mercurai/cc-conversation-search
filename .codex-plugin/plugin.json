@@ -1,6 +1,6 @@
 {
   "name": "cc-conversation-search",
-  "version": "0.5.4",
+  "version": "0.6.0",
   "description": "Codex adapter for Mercurai's cc-conversation-search fork with Claude session mining and transcript fallbacks.",
   "author": {
     "name": "mercurai",
