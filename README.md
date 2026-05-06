@@ -161,12 +161,6 @@ Get context around a specific message
 cc-conversation-search context MESSAGE_UUID [--depth 5] [--content] [--json]
 ```
 
-### `cc-conversation-search mine-session`
-Resolve and mine a Claude Code session transcript
-```bash
-cc-conversation-search mine-session SESSION_ID [--transcript PATH]
-```
-
 ### `cc-conversation-search list`
 List recent conversations with calendar date support
 ```bash
@@ -183,6 +177,38 @@ View conversation tree structure
 ```bash
 cc-conversation-search tree SESSION_ID [--json]
 ```
+
+### `cc-conversation-search mine-session`
+Resolve a session ID to a transcript, parse the transcript, and report what
+the session did. Used by both Claude- and Codex-side skills for retrospective
+session analysis.
+
+```bash
+# Human-readable text report (default)
+cc-conversation-search mine-session SESSION_ID [--transcript PATH]
+
+# Structured machine-readable output (schema_version: 1)
+cc-conversation-search mine-session SESSION_ID [--transcript PATH] --json
+```
+
+The `--json` output is a single object with stable top-level keys:
+
+| Key | Description |
+|---|---|
+| `schema_version` | Integer. `1` today. Bumped on breaking changes. |
+| `session_id` | The session ID that was looked up. |
+| `resolution` | Stage-based resolution result (see `resolve_session()` in `core/session_miner.py`). Stages run in order `tree → explicit → claude_root`. Codex filename matches are recorded as evidence-only and never set `resolved=true`. |
+| `summary` | Parsed transcript summary (record/tool/attachment counts, files touched, shell commands, errors, time range). `null` when the transcript could not be resolved. |
+| `db_signals` | Per-DB lookup result for known autoresearch / research databases. |
+| `recommendations` | Stable list of operator-facing recommendations. |
+
+The output is fully JSON-serializable — no `Path`, `datetime`, or `Counter`
+objects leak through. Counters are emitted as
+`[{"name": "...", "count": N}, ...]` ordered descending. The same payload is
+produced by both the package CLI (`cc-conversation-search mine-session`) and
+the Codex wrapper script
+(`codex-skills/claude-session-miner/scripts/mine_claude_session.py`); both go
+through `conversation_search.run_mine_session()`.
 
 ## Architecture
 

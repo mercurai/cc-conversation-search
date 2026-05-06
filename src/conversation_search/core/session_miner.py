@@ -1,25 +1,44 @@
 """Resolve and mine a Claude Code session transcript.
 
-Phase 1 (mercurai/cc-conversation-search#2): correctness work for stage-based
-session resolution and project-path normalization. The CLI surface
-(`cc-conversation-search mine-session <id> [--transcript <path>]`) is preserved.
+Phase 1 (issue #2): correctness work for stage-based session resolution and
+project-path normalization. Phase 2 (issue #3): structured machine-readable
+contract via `mine_session()` and `mine-session --json`.
 
-The public entry points exposed by this module are:
+Public surface used by adapters and tests:
 
-    resolve_session(session_id, explicit_path=None) -> dict
+    resolve_session(session_id, explicit_path=None, claude_root=None,
+                    codex_roots=None) -> dict
         Stage-based resolver. Returns stable structured metadata describing
         each resolution stage that was attempted, what it found, and which
         stage (if any) succeeded. Codex filename matches are recorded as
         evidence-only and never count as resolution.
 
+    mine_session(session_id, transcript=None) -> dict
+        Single source of structured truth. Combines `resolve_session`,
+        `parse_transcript`, and DB lookups into one fully JSON-serializable
+        dict (no Path / datetime / Counter leakage). `build_report` and the
+        `--json` CLI mode both source data from this function.
+
     parse_transcript(path) -> dict
-        Extract a structured summary of a single transcript JSONL.
+        Low-level transcript JSONL summary. Note: returns Counter and Path
+        objects; consumers that need JSON should use `mine_session` instead.
 
     build_report(session_id, transcript=None) -> str
-        Human-readable text report. Internally delegates to resolve_session.
+        Human-readable text report; the existing default CLI output mode.
+
+    add_mine_session_args(parser)
+        Shared argparse helper. Registers `session_id`, `--transcript`,
+        `--json` on the supplied parser. Used by both `parse_args` (the
+        Codex wrapper path) and `cli.py`'s mine-session subparser so the
+        flag surface cannot drift between entry points.
+
+    run_mine_session(session_id, transcript, json_output) -> int
+        Shared execution function. Both the package CLI and the Codex
+        wrapper end up here, ensuring identical output for identical args.
 
     main(argv=None)
-        CLI entry point used by the package console script.
+        Entry point used by `codex-skills/claude-session-miner/scripts/
+        mine_claude_session.py` via `core.session_miner.main()`.
 """
 
 import argparse
@@ -30,23 +49,48 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any, Optional
+
+# Schema version for the structured `mine_session()` / `mine-session --json`
+# output contract. Bump on breaking changes; subkey additions are additive.
+SCHEMA_VERSION = 1
 
 # Ordered resolution stages. `codex_filename_matches` is intentionally NOT
 # present in this list — Codex-side filename matches are evidence only.
 RESOLUTION_STAGES = ("tree", "explicit", "claude_root")
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Resolve and mine a Claude Code session transcript."
+def add_mine_session_args(parser):
+    """Register the mine-session CLI surface on `parser`.
+
+    Used by both `session_miner.parse_args()` (Codex wrapper path) and
+    `cli.py`'s `mine-session` subparser so the flag set cannot drift
+    between entry points.
+    """
+    parser.add_argument(
+        "session_id",
+        help="Claude Code session ID to resolve and mine",
     )
-    parser.add_argument("session_id", help="Claude Code session ID to resolve and mine")
     parser.add_argument(
         "--transcript",
         help="Explicit path to a transcript JSONL file. Windows paths are supported.",
     )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit the structured mine_session() result as JSON instead of the text report.",
+    )
+    return parser
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Resolve and mine a Claude Code session transcript.",
+    )
+    add_mine_session_args(parser)
     return parser.parse_args(argv)
 
 
@@ -657,20 +701,152 @@ def format_counter(counter, limit=None):
 
 
 # ---------------------------------------------------------------------------
-# Human-readable report (built from structured data)
+# JSON serialization helpers
 # ---------------------------------------------------------------------------
 
-def build_report(session_id, transcript=None):
+def _jsonable(value: Any) -> Any:
+    """Recursively coerce a value into something `json.dumps` accepts without
+    needing a `default=` fallback.
+
+    - Counter -> list of {"name", "count"} ordered by count desc
+    - dict    -> dict with normalized values
+    - list/tuple/set -> list with normalized members
+    - Path    -> str
+    - datetime/date -> isoformat()
+    - other   -> str fallback only for unknown non-trivial types
+    """
+    if isinstance(value, Counter):
+        return [{"name": str(name), "count": int(count)} for name, count in value.most_common()]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _summary_to_json(summary: Optional[dict]) -> Optional[dict]:
+    """Coerce a parse_transcript() return value into a JSON-clean dict."""
+    if summary is None:
+        return None
+    out = {
+        "path": str(summary["path"]) if summary.get("path") else None,
+        "records": int(summary.get("records", 0)),
+        "user_turns": int(summary.get("user_turns", 0)),
+        "assistant_turns": int(summary.get("assistant_turns", 0)),
+        "time_range": list(summary.get("time_range", (None, None))),
+        "record_counts": _jsonable(summary.get("record_counts", Counter())),
+        "attachment_counts": _jsonable(summary.get("attachment_counts", Counter())),
+        "tool_counts": _jsonable(summary.get("tool_counts", Counter())),
+        "files_touched": [
+            {"path": str(p), "count": int(c)}
+            for p, c in summary.get("files_touched", Counter()).most_common()
+        ],
+        "shell_commands": list(summary.get("shell_commands", [])),
+        "user_prompts": list(summary.get("user_prompts", [])),
+        "queue_summaries": list(summary.get("queue_summaries", [])),
+        "errors": [
+            {
+                "timestamp": e.get("timestamp"),
+                "type": e.get("type"),
+                "hook": e.get("hook"),
+                "command": e.get("command"),
+                "stderr": e.get("stderr") if isinstance(e.get("stderr"), (str, type(None))) else str(e.get("stderr")),
+                "exit_code": e.get("exit_code"),
+            }
+            for e in summary.get("errors", [])
+        ],
+    }
+    return out
+
+
+def _db_signal_to_json(result: dict) -> dict:
+    """Coerce a lookup_db() return value into a JSON-clean dict."""
+    return {
+        "path": str(result.get("path")) if result.get("path") is not None else None,
+        "status": result.get("status"),
+        "error": result.get("error"),
+        "matches": [
+            {"table": m.get("table"), "row": _jsonable(m.get("row", {}))}
+            for m in result.get("matches", [])
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Recommendations (single source — used by both text and JSON modes)
+# ---------------------------------------------------------------------------
+
+_RECOMMENDATIONS = (
+    "Use cc-conversation-search tree for session IDs and treat JSON errors as unresolved.",
+    "Prefer explicit transcript paths when working across machines or mixed Windows/Linux environments.",
+    "Keep Codex transcript references separate from Claude transcript resolution unless the filename itself matches the target session ID.",
+    "Feed resolved session metadata and transcript-derived metrics into autoresearch after transcript resolution succeeds.",
+)
+
+
+# ---------------------------------------------------------------------------
+# mine_session: single source of structured truth
+# ---------------------------------------------------------------------------
+
+def mine_session(session_id: str, transcript: Optional[str] = None) -> dict:
+    """Run the full mining pipeline and return a fully JSON-serializable dict.
+
+    Both `build_report` (text mode) and `run_mine_session` (--json mode)
+    consume this function's output. The dict contains no Path / datetime /
+    Counter objects and survives `json.dumps(...)` without `default=`.
+
+    Schema (`schema_version: 1`):
+        {
+          "schema_version": 1,
+          "session_id": "...",
+          "resolution": { ... resolve_session output, JSON-clean ... },
+          "summary":    { ... parse_transcript output, JSON-clean ... } | null,
+          "db_signals": [ {path, status, error, matches}, ... ],
+          "recommendations": [ "...", ... ]
+        }
+    """
     resolution = resolve_session(session_id, transcript)
     resolved_path = Path(resolution["resolved_path"]) if resolution["resolved_path"] else None
-    tree_metadata = resolution["tree_metadata"]
-    transcript_summary = parse_transcript(resolved_path) if resolved_path else None
+    summary_raw = parse_transcript(resolved_path) if resolved_path else None
     db_paths = [
         Path.home() / ".claude" / "research.db",
         Path.home() / ".claude" / "skills" / "autoresearch" / "research.db",
         Path.home() / ".claude" / "skills" / "autoresearch" / "autoresearch.db",
     ]
-    db_results = [lookup_db(session_id, db_path) for db_path in db_paths]
+    db_results = [_db_signal_to_json(lookup_db(session_id, p)) for p in db_paths]
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id,
+        "resolution": _jsonable(resolution),
+        "summary": _summary_to_json(summary_raw),
+        "db_signals": db_results,
+        "recommendations": list(_RECOMMENDATIONS),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Human-readable report (built from mine_session() output)
+# ---------------------------------------------------------------------------
+
+def build_report(session_id, transcript=None):
+    data = mine_session(session_id, transcript)
+    resolution = data["resolution"]
+    tree_metadata = resolution.get("tree_metadata")
+    summary = data["summary"]
+    db_results = data["db_signals"]
+
+    def _name_count_lines(items, limit):
+        items = items[:limit] if limit else items
+        if not items:
+            return ["(none)"]
+        return [f"{it['name']}: {it['count']}" for it in items]
 
     lines = []
     lines.extend(["Resolution", "-" * len("Resolution")])
@@ -688,6 +864,7 @@ def build_report(session_id, transcript=None):
         lines.append(f"Indexed at: {tree_metadata.get('indexed_at')}")
     elif resolution["project_path"]:
         lines.append(f"Project path (recovered): {resolution['project_path']}")
+    resolved_path = resolution["resolved_path"]
     lines.append(f"Resolved transcript: {resolved_path if resolved_path else '(not found)'}")
     if resolution["resolution_stage"]:
         lines.append(f"Resolution stage: {resolution['resolution_stage']}")
@@ -695,8 +872,10 @@ def build_report(session_id, transcript=None):
     for item in resolution["stages"]["tree"]["checked"]:
         lines.append(f"- {item}")
     if resolution["stages"]["explicit"]["provided"]:
-        lines.append(f"- explicit transcript: {resolution['stages']['explicit']['path']}"
-                     + (" (exists)" if resolution["stages"]["explicit"]["exists"] else " (missing)"))
+        lines.append(
+            f"- explicit transcript: {resolution['stages']['explicit']['path']}"
+            + (" (exists)" if resolution["stages"]["explicit"]["exists"] else " (missing)")
+        )
     lines.append(f"- {resolution['stages']['claude_root']['checked']}")
     if resolution["stages"]["codex_filename_matches"]:
         lines.append("Codex filename matches (evidence only, not treated as resolution):")
@@ -704,44 +883,44 @@ def build_report(session_id, transcript=None):
             lines.append(f"- {match}")
 
     lines.extend(["", "Session Summary", "-" * len("Session Summary")])
-    if not transcript_summary:
+    if not summary:
         lines.append("Transcript could not be resolved.")
     else:
-        lines.append(f"Records: {transcript_summary['records']}")
+        lines.append(f"Records: {summary['records']}")
         lines.append(
             "Time range: "
-            f"{transcript_summary['time_range'][0]} -> {transcript_summary['time_range'][1]}"
+            f"{summary['time_range'][0]} -> {summary['time_range'][1]}"
         )
-        lines.append(f"User turns: {transcript_summary['user_turns']}")
-        lines.append(f"Assistant turns: {transcript_summary['assistant_turns']}")
+        lines.append(f"User turns: {summary['user_turns']}")
+        lines.append(f"Assistant turns: {summary['assistant_turns']}")
         lines.append("Top record types:")
-        lines.extend(f"- {line}" for line in format_counter(transcript_summary["record_counts"], 10))
+        lines.extend(f"- {ln}" for ln in _name_count_lines(summary["record_counts"], 10))
         lines.append("Top attachment types:")
-        lines.extend(f"- {line}" for line in format_counter(transcript_summary["attachment_counts"], 10))
+        lines.extend(f"- {ln}" for ln in _name_count_lines(summary["attachment_counts"], 10))
         lines.append("Top tool calls:")
-        lines.extend(f"- {line}" for line in format_counter(transcript_summary["tool_counts"], 15))
+        lines.extend(f"- {ln}" for ln in _name_count_lines(summary["tool_counts"], 15))
 
     lines.extend(["", "Evidence", "-" * len("Evidence")])
-    if not transcript_summary:
+    if not summary:
         lines.append("No transcript evidence available.")
     else:
         lines.append("Sample user prompts:")
-        lines.extend(f"- {shorten(prompt, 180)}" for prompt in transcript_summary["user_prompts"][:12])
+        lines.extend(f"- {shorten(prompt, 180)}" for prompt in summary["user_prompts"][:12])
         lines.append("Shell commands:")
-        lines.extend(f"- {shorten(command, 220)}" for command in transcript_summary["shell_commands"][:20])
+        lines.extend(f"- {shorten(command, 220)}" for command in summary["shell_commands"][:20])
         lines.append("Files touched:")
         lines.extend(
-            f"- {path} ({count})"
-            for path, count in transcript_summary["files_touched"].most_common(20)
+            f"- {it['path']} ({it['count']})"
+            for it in summary["files_touched"][:20]
         )
         lines.append("Background or agent summaries:")
         lines.extend(
-            f"- {shorten(summary, 220)}"
-            for summary in transcript_summary["queue_summaries"][:20]
+            f"- {shorten(item, 220)}"
+            for item in summary["queue_summaries"][:20]
         )
         lines.append("Errors or failures:")
-        if transcript_summary["errors"]:
-            for error in transcript_summary["errors"][:20]:
+        if summary["errors"]:
+            for error in summary["errors"][:20]:
                 details = [
                     error.get("type"),
                     error.get("hook"),
@@ -764,14 +943,36 @@ def build_report(session_id, transcript=None):
             lines.append(f"  match: {match['table']} -> {shorten(match['row'], 220)}")
 
     lines.extend(["", "Recommendations", "-" * len("Recommendations")])
-    lines.append("- Use cc-conversation-search tree for session IDs and treat JSON errors as unresolved.")
-    lines.append("- Prefer explicit transcript paths when working across machines or mixed Windows/Linux environments.")
-    lines.append("- Keep Codex transcript references separate from Claude transcript resolution unless the filename itself matches the target session ID.")
-    lines.append("- Feed resolved session metadata and transcript-derived metrics into autoresearch after transcript resolution succeeds.")
+    for rec in data["recommendations"]:
+        lines.append(f"- {rec}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Shared execution surface
+# ---------------------------------------------------------------------------
+
+def run_mine_session(session_id: str, transcript: Optional[str] = None,
+                     json_output: bool = False, stream=None) -> int:
+    """Render the mine-session result.
+
+    Both `cli.py`'s `cmd_mine_session` and `session_miner.main()` call this
+    so the two entry points cannot drift. Returns a process exit code.
+    """
+    out = stream if stream is not None else sys.stdout
+    if json_output:
+        data = mine_session(session_id, transcript)
+        # No default= — if a non-serializable type leaks through, surface it
+        # as a hard failure rather than silently stringify.
+        out.write(json.dumps(data, indent=2))
+        out.write("\n")
+    else:
+        out.write(build_report(session_id, transcript))
+        out.write("\n")
+    return 0
 
 
 def main(argv=None):
     configure_stdio()
     args = parse_args(argv)
-    print(build_report(args.session_id, args.transcript))
+    return run_mine_session(args.session_id, args.transcript, json_output=args.json_output)

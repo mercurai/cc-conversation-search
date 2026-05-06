@@ -20,16 +20,23 @@ Use this skill when asked to inspect, review, mine, summarize, or recover contex
    - `cc-conversation-search search "<topic>" --json --limit 20`
    - `cc-conversation-search context <message-uuid> --json --content`
 3. For transcript mining and local fallback, use:
-   - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id>`
+   - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id>` — text report
+   - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id> --json` — structured machine-readable output (`schema_version: 1`)
    - If an explicit transcript path was provided:
-     - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id> --transcript "<path-to-jsonl>"`
+     - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id> --transcript "<path-to-jsonl>" [--json]`
+   - The `--json` flag flows through both the wrapper script and the package CLI (`cc-conversation-search mine-session ... --json`); both produce identical output for identical args.
 4. Prefer evidence from the actual Claude transcript over secondary logs or summaries.
 
-## Constraints
+## Resolution rules
 
-- `tree` is for session IDs.
+These rules govern how Claude session IDs are resolved. They are shared with
+the Claude-side `conversation-search` skill; both must agree.
+
+- **`tree` is for session IDs.** Use `cc-conversation-search tree <session-id> --json` for ID lookup.
+- **`tree` JSON containing an `error` field is unresolved**, even when the command exits `0`.
+- **Explicit transcript path is the preferred fallback** when the index is stale or unavailable. Pass `--transcript "<path>"`.
+- **Codex-side filename matches are evidence-only.** Encountering the session ID inside a Codex transcript or store does NOT count as resolution.
 - `resume` expects a message UUID, not a session UUID.
-- Do not treat incidental mentions of a session ID in Codex transcripts as proof of session resolution.
 - Report from evidence only.
 
 ## Output

@@ -12,7 +12,10 @@ from typing import Any, Dict, List, Union
 
 from conversation_search.core.indexer import ConversationIndexer
 from conversation_search.core.search import ConversationSearch, format_timestamp
-from conversation_search.core.session_miner import build_report
+from conversation_search.core.session_miner import (
+    add_mine_session_args,
+    run_mine_session,
+)
 
 try:
     __version__ = version("cc-conversation-search")
@@ -362,8 +365,14 @@ def cmd_resume(args):
 
 
 def cmd_mine_session(args):
-    """Resolve and mine a Claude Code session transcript"""
-    print(build_report(args.session_id, args.transcript))
+    """Resolve and mine a Claude Code session transcript.
+
+    Delegates to `run_mine_session` so the package CLI and the Codex
+    wrapper (`codex-skills/claude-session-miner/scripts/mine_claude_session.py`,
+    which goes through `session_miner.main()`) share the exact same
+    execution path. See issue #3.
+    """
+    run_mine_session(args.session_id, args.transcript, json_output=args.json_output)
 
 
 def main():
@@ -436,10 +445,11 @@ def main():
     resume_parser.add_argument('uuid', help='Message UUID')
     resume_parser.set_defaults(func=cmd_resume)
 
-    # mine-session command
+    # mine-session command — flag surface lives in session_miner.add_mine_session_args
+    # so this subparser and the Codex wrapper (which goes through
+    # session_miner.main() / parse_args()) cannot drift.
     mine_parser = subparsers.add_parser('mine-session', help='Resolve and mine a Claude Code session transcript')
-    mine_parser.add_argument('session_id', help='Claude Code session ID')
-    mine_parser.add_argument('--transcript', help='Explicit transcript path')
+    add_mine_session_args(mine_parser)
     mine_parser.set_defaults(func=cmd_mine_session)
 
     args = parser.parse_args()

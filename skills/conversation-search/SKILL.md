@@ -8,6 +8,13 @@ allowed-tools: Bash, TodoWrite
 
 Find past conversations in your Claude Code history and get the commands to resume them.
 
+## See also
+
+For **transcript mining** (resolving a single session and parsing it into structured
+facts — tool calls, files touched, errors, recommendations), use the
+`claude-session-miner` skill or run `cc-conversation-search mine-session <id> --json`
+directly. This skill covers search, listing, and resumption only.
+
 ## MANDATORY FIRST STEP - CREATE TODO CHECKLIST
 
 **Before doing ANYTHING else, you MUST use the TodoWrite tool to create this exact checklist:**
@@ -214,6 +221,11 @@ cc-conversation-search tree <SESSION_ID> --json
 ```
 
 **Always use `--json` for structured output.**
+
+**Resolution rule (shared with the `claude-session-miner` skill):** Treat any
+`cc-conversation-search tree <SESSION_ID> --json` response containing an
+`"error"` field as unresolved, even when the command exits `0`. Do not infer
+session existence from incidental mentions in Codex-side transcripts.
 
 ## Examples
 
