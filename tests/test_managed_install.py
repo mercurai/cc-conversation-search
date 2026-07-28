@@ -39,8 +39,7 @@ def test_managed_checkout_dry_run_installs_exact_current_checkout_without_git_ne
     assert "git pull" not in output
     assert "would re-exec" not in output
     assert "codex plugin add cc-conversation-search@mercurai-local-plugins" in output
-    assert "claude-session-miner" in output
-    assert "codex-session-miner" in output
+    assert "would install managed skill" not in output
 
 
 def test_default_dry_run_keeps_canonical_checkout_redirect_behavior(tmp_path):
@@ -53,12 +52,13 @@ def test_default_dry_run_keeps_canonical_checkout_redirect_behavior(tmp_path):
     assert "would re-exec" in output
 
 
-def test_managed_checkout_refuses_non_directory_skill_target(tmp_path):
+def test_managed_checkout_leaves_direct_global_skill_paths_unmanaged(tmp_path):
     skill_target = tmp_path / ".agents" / "skills" / "claude-session-miner"
     skill_target.parent.mkdir(parents=True)
     skill_target.write_text("do not overwrite", encoding="utf-8")
 
     result = run_installer(tmp_path, "--managed-checkout", "--dry-run")
 
-    assert result.returncode != 0
-    assert "refusing unsafe skill target" in (result.stdout + result.stderr).lower()
+    assert result.returncode == 0, result.stderr
+    assert skill_target.read_text(encoding="utf-8") == "do not overwrite"
+    assert "would install managed skill" not in result.stdout.lower()

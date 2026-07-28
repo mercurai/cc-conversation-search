@@ -269,69 +269,6 @@ PY
 fi
 
 # ---------------------------------------------------------------------------
-# Managed provider-skill packaging
-# ---------------------------------------------------------------------------
-
-install_managed_skill() {
-  local skill_name="$1"
-  local source_path="${REPO_ROOT}/codex-skills/${skill_name}/SKILL.md"
-  local target_dir="${HOME}/.agents/skills/${skill_name}"
-  local target_skill="${target_dir}/SKILL.md"
-  local marker="${target_dir}/.cc-conversation-search-managed"
-
-  [[ -f "${source_path}" ]] || {
-    say "Missing packaged skill: ${source_path}"
-    exit 1
-  }
-
-  if [[ -L "${target_dir}" || ( -e "${target_dir}" && ! -d "${target_dir}" ) ]]; then
-    say "Refusing unsafe skill target: ${target_dir}"
-    exit 1
-  fi
-  if [[ -L "${target_skill}" ]]; then
-    say "Refusing unsafe skill target: ${target_skill}"
-    exit 1
-  fi
-
-  if [[ -d "${target_dir}" && ! -f "${marker}" ]]; then
-    local entry
-    for entry in "${target_dir}"/* "${target_dir}"/.[!.]* "${target_dir}"/..?*; do
-      [[ -e "${entry}" || -L "${entry}" ]] || continue
-      case "$(basename "${entry}")" in
-        SKILL.md) ;;
-        *)
-          say "Refusing unmanaged skill directory with extra files: ${target_dir}"
-          exit 1
-          ;;
-      esac
-    done
-    if [[ -f "${target_skill}" ]] && ! cmp -s "${source_path}" "${target_skill}"; then
-      say "Refusing to overwrite unmanaged skill: ${target_skill}"
-      exit 1
-    fi
-  fi
-
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    say "[DRY-RUN] would install managed skill ${skill_name} from ${source_path} to ${target_dir}"
-    return
-  fi
-
-  mkdir -p "${target_dir}"
-  local temp_skill="${target_dir}/.SKILL.md.tmp.$$"
-  cp "${source_path}" "${temp_skill}"
-  mv -f "${temp_skill}" "${target_skill}"
-  {
-    printf 'source=%s\n' "${ROOT_CANONICAL}"
-    printf 'commit=%s\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-  } > "${marker}"
-}
-
-if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
-  install_managed_skill "claude-session-miner"
-  install_managed_skill "codex-session-miner"
-fi
-
-# ---------------------------------------------------------------------------
 # Codex marketplace activation
 # ---------------------------------------------------------------------------
 
