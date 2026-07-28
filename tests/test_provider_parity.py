@@ -555,5 +555,6 @@ def test_installer_activates_codex_plugin_through_supported_cli():
         in installer
     )
     assert 'MARKETPLACE_NAME="mercurai-managed-plugins"' in installer
+    assert 'expected_plugin_source="${ROOT_CANONICAL}"' in installer
     assert "codex_plugin_ready" in installer
     assert 'get("enabled") is not True' in installer

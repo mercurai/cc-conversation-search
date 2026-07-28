@@ -386,7 +386,7 @@ if command -v codex >/dev/null 2>&1; then
 
     expected_plugin_source=""
     if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
-      expected_plugin_source="${PLUGIN_SOURCE_PATH}"
+      expected_plugin_source="${ROOT_CANONICAL}"
     fi
 
     # `plugin add` records the plugin in Codex config with enabled=true. A
