@@ -554,4 +554,5 @@ def test_installer_activates_codex_plugin_through_supported_cli():
         "codex plugin add cc-conversation-search@mercurai-local-plugins --json"
         in installer
     )
-    assert '"enabled") is True' in installer
+    assert "codex_plugin_ready" in installer
+    assert 'get("enabled") is not True' in installer

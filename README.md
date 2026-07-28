@@ -159,6 +159,30 @@ bash install.sh --dry-run                       # print actions, do not execute
 INSTALL_FORCE_STALE=1 bash install.sh --dry-run # also exercise the recovery branch
 ```
 
+### Pinned managed-checkout installation
+
+Configuration managers that already created and verified a pinned checkout
+must use the explicit in-place mode:
+
+```bash
+bash /path/to/pinned/checkout/install.sh --managed-checkout
+```
+
+This mode preserves the caller's pin:
+
+- installs the CLI from the exact checkout that contains `install.sh`;
+- never clones, fetches, pulls, redirects, or re-executes another checkout;
+- refuses a dirty managed checkout;
+- writes the exact absolute checkout path into the local marketplace entry;
+- installs the explicit Claude and Codex miner skills only into safe,
+  plugin-owned directories; and
+- activates the Codex plugin and verifies through JSON state that it is enabled
+  from the expected checkout.
+
+Use `--managed-checkout --dry-run` to inspect the complete plan without writes.
+The default mode remains the canonical `~/plugins/cc-conversation-search`
+workflow for interactive users.
+
 ### Stale-launcher recovery
 
 The most common failure mode is a `cc-conversation-search` launcher left over from a removed `uv tool` venv: the binary exists on PATH but `cc-conversation-search --version` fails or `uv tool list` does not list it. `install.sh`'s pre-flight detects this and runs the recovery sequence below automatically. To repair manually:

@@ -89,6 +89,19 @@ git clone https://github.com/mercurai/cc-conversation-search ~/plugins/cc-conver
 bash ~/plugins/cc-conversation-search/install.sh
 ```
 
+**Pinned/managed checkout:**
+
+When another configuration manager already checked out an exact commit, use:
+
+```bash
+bash /path/to/pinned/checkout/install.sh --managed-checkout
+```
+
+This installs in place without clone/fetch/pull or redirecting to
+`~/plugins/cc-conversation-search`. It records the exact checkout as the Codex
+plugin source, safely packages both provider skills, and verifies the enabled
+plugin through `codex plugin list --json`.
+
 Do not run `uv tool upgrade cc-conversation-search` — that re-resolves from
 PyPI and would replace this mercurai build with the upstream package.
 

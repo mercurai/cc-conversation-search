@@ -68,6 +68,11 @@ bash ~/plugins/cc-conversation-search/install.sh
 
 Do not run `uv tool upgrade cc-conversation-search` — that re-resolves from PyPI and would replace the mercurai build with the upstream package.
 
+Pinned configuration managers should invoke
+`install.sh --managed-checkout`. That mode installs from the invoking checkout
+without Git network or redirect operations and verifies the enabled Codex
+plugin source against the exact checkout.
+
 If `cc-conversation-search` is on your PATH but fails, see the **Recovery** section in `INSTALL.md` — the most common failure mode is a launcher left over from a removed `uv tool` environment.
 
 ## What's Included
