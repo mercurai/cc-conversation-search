@@ -6,6 +6,8 @@ DEFAULT_REMOTE="https://github.com/mercurai/cc-conversation-search.git"
 TARGET_DIR="${HOME}/plugins/${PLUGIN_NAME}"
 MARKETPLACE_ROOT="${HOME}"
 MARKETPLACE_PATH="${MARKETPLACE_ROOT}/.agents/plugins/marketplace.json"
+MARKETPLACE_NAME="mercurai-local-plugins"
+MARKETPLACE_DISPLAY_NAME="Mercurai Local Plugins"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
@@ -137,6 +139,8 @@ if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
   INSTALL_ROOT="${REPO_ROOT}"
   MARKETPLACE_ROOT="$(dirname "${ROOT_CANONICAL}")"
   MARKETPLACE_PATH="${MARKETPLACE_ROOT}/.agents/plugins/marketplace.json"
+  MARKETPLACE_NAME="mercurai-managed-plugins"
+  MARKETPLACE_DISPLAY_NAME="Mercurai Managed Plugins"
   PLUGIN_SOURCE_PATH="./$(basename "${ROOT_CANONICAL}")"
   say "Managed checkout: ${ROOT_CANONICAL}"
   say "Marketplace root: ${MARKETPLACE_ROOT}"
@@ -226,13 +230,19 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   say "[DRY-RUN] would update marketplace entry for cc-conversation-search at ${MARKETPLACE_PATH}"
   say "[DRY-RUN] marketplace plugin source: ${PLUGIN_SOURCE_PATH}"
 else
-  python - "${MARKETPLACE_PATH}" "${PLUGIN_SOURCE_PATH}" <<'PY'
+  python - \
+    "${MARKETPLACE_PATH}" \
+    "${PLUGIN_SOURCE_PATH}" \
+    "${MARKETPLACE_NAME}" \
+    "${MARKETPLACE_DISPLAY_NAME}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 plugin_source_path = sys.argv[2]
+marketplace_name = sys.argv[3]
+marketplace_display_name = sys.argv[4]
 
 plugin_entry = {
     "name": "cc-conversation-search",
@@ -251,8 +261,8 @@ if path.exists():
     data = json.loads(path.read_text(encoding="utf-8"))
 else:
     data = {
-        "name": "mercurai-local-plugins",
-        "interface": {"displayName": "Mercurai Local Plugins"},
+        "name": marketplace_name,
+        "interface": {"displayName": marketplace_display_name},
         "plugins": [],
     }
 
@@ -264,9 +274,9 @@ for idx, plugin in enumerate(plugins):
 else:
     plugins.append(plugin_entry)
 
-data.setdefault("name", "mercurai-local-plugins")
-data.setdefault("interface", {"displayName": "Mercurai Local Plugins"})
-data["interface"].setdefault("displayName", "Mercurai Local Plugins")
+data["name"] = marketplace_name
+data.setdefault("interface", {})
+data["interface"]["displayName"] = marketplace_display_name
 
 path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 PY
@@ -280,13 +290,14 @@ codex_plugin_installed() {
   codex plugin list --json | python -c '
 import json
 import sys
+expected_id = sys.argv[1]
 data = json.load(sys.stdin)
 matches = [
     item for item in data.get("installed", [])
-    if item.get("pluginId") == "cc-conversation-search@mercurai-local-plugins"
+    if item.get("pluginId") == expected_id
 ]
 raise SystemExit(0 if matches else 1)
-'
+' "${PLUGIN_SPEC}"
 }
 
 codex_marketplace_ready() {
@@ -297,6 +308,7 @@ import os
 import sys
 
 expected = sys.argv[1]
+expected_name = sys.argv[2]
 
 def normalized(path):
     if not isinstance(path, str) or not path:
@@ -308,14 +320,14 @@ def normalized(path):
 data = json.load(sys.stdin)
 matches = [
     item for item in data.get("marketplaces", [])
-    if item.get("name") == "mercurai-local-plugins"
+    if item.get("name") == expected_name
 ]
 if not matches:
     raise SystemExit(1)
 if expected and normalized(matches[0].get("root")) != normalized(expected):
     raise SystemExit(1)
 raise SystemExit(0)
-' "${expected_root}"
+' "${expected_root}" "${MARKETPLACE_NAME}"
 }
 
 codex_plugin_ready() {
@@ -326,6 +338,7 @@ import os
 import sys
 
 expected = sys.argv[1]
+expected_id = sys.argv[2]
 
 def normalized(path):
     if not isinstance(path, str) or not path:
@@ -337,7 +350,7 @@ def normalized(path):
 data = json.load(sys.stdin)
 matches = [
     item for item in data.get("installed", [])
-    if item.get("pluginId") == "cc-conversation-search@mercurai-local-plugins"
+    if item.get("pluginId") == expected_id
 ]
 if not matches or matches[0].get("enabled") is not True:
     raise SystemExit(1)
@@ -346,13 +359,15 @@ if expected:
     if normalized(actual) != normalized(expected):
         raise SystemExit(1)
 raise SystemExit(0)
-' "${expected_source}"
+' "${expected_source}" "${PLUGIN_SPEC}"
 }
+
+PLUGIN_SPEC="${PLUGIN_NAME}@${MARKETPLACE_NAME}"
 
 if command -v codex >/dev/null 2>&1; then
   if [[ "${DRY_RUN}" == "1" ]]; then
-    say "[DRY-RUN] would ensure marketplace 'mercurai-local-plugins' is configured from ${MARKETPLACE_ROOT}"
-    say "[DRY-RUN] would run: codex plugin add cc-conversation-search@mercurai-local-plugins --json"
+    say "[DRY-RUN] would ensure marketplace '${MARKETPLACE_NAME}' is configured from ${MARKETPLACE_ROOT}"
+    say "[DRY-RUN] would run: codex plugin add ${PLUGIN_SPEC} --json"
     if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
       say "[DRY-RUN] would verify Codex JSON state is enabled with source ${PLUGIN_SOURCE_PATH}"
     fi
@@ -364,7 +379,7 @@ if command -v codex >/dev/null 2>&1; then
     if ! codex_marketplace_ready "${expected_marketplace_root}"; then
       if [[ "${MANAGED_CHECKOUT}" == "1" ]] \
         && codex_marketplace_ready ""; then
-        codex plugin marketplace remove mercurai-local-plugins
+        codex plugin marketplace remove "${MARKETPLACE_NAME}" --json || true
       fi
       codex plugin marketplace add "${MARKETPLACE_ROOT}" --json
     fi
@@ -381,9 +396,9 @@ if command -v codex >/dev/null 2>&1; then
       say "Codex plugin is already installed and enabled."
     else
       if [[ "${MANAGED_CHECKOUT}" == "1" ]] && codex_plugin_installed; then
-        codex plugin remove cc-conversation-search@mercurai-local-plugins
+        codex plugin remove "${PLUGIN_SPEC}"
       fi
-      codex plugin add cc-conversation-search@mercurai-local-plugins --json
+      codex plugin add "${PLUGIN_SPEC}" --json
     fi
 
     if ! codex_plugin_ready "${expected_plugin_source}"; then

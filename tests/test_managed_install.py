@@ -47,7 +47,7 @@ def test_managed_checkout_dry_run_installs_exact_current_checkout_without_git_ne
     assert "git fetch" not in output
     assert "git pull" not in output
     assert "would re-exec" not in output
-    assert "codex plugin add cc-conversation-search@mercurai-local-plugins" in output
+    assert "codex plugin add cc-conversation-search@mercurai-managed-plugins" in output
     assert "would install managed skill" not in output
 
 

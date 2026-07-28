@@ -551,8 +551,9 @@ def test_installer_activates_codex_plugin_through_supported_cli():
     installer = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
 
     assert (
-        "codex plugin add cc-conversation-search@mercurai-local-plugins --json"
+        'codex plugin add "${PLUGIN_SPEC}" --json'
         in installer
     )
+    assert 'MARKETPLACE_NAME="mercurai-managed-plugins"' in installer
     assert "codex_plugin_ready" in installer
     assert 'get("enabled") is not True' in installer
