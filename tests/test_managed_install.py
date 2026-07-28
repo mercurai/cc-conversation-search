@@ -30,8 +30,17 @@ def test_managed_checkout_dry_run_installs_exact_current_checkout_without_git_ne
     assert result.returncode == 0, result.stderr
     output = result.stdout.replace("\\", "/").lower()
     expected_checkout = str(REPO_ROOT).replace("\\", "/").lower()
+    expected_marketplace_root = str(REPO_ROOT.parent).replace("\\", "/").lower()
     assert f"managed checkout: {expected_checkout}" in output
-    assert f"marketplace plugin source: {expected_checkout}" in output
+    assert "marketplace plugin source: ./cc-conversation-search" in output
+    assert (
+        f"marketplace root: {expected_marketplace_root}"
+        in output
+    )
+    assert (
+        f"{expected_marketplace_root}/.agents/plugins/marketplace.json"
+        in output
+    )
     assert "uv tool install --force" in output
     assert expected_checkout in output
     assert "git clone" not in output

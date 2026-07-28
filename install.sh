@@ -4,7 +4,8 @@ set -euo pipefail
 PLUGIN_NAME="cc-conversation-search"
 DEFAULT_REMOTE="https://github.com/mercurai/cc-conversation-search.git"
 TARGET_DIR="${HOME}/plugins/${PLUGIN_NAME}"
-MARKETPLACE_PATH="${HOME}/.agents/plugins/marketplace.json"
+MARKETPLACE_ROOT="${HOME}"
+MARKETPLACE_PATH="${MARKETPLACE_ROOT}/.agents/plugins/marketplace.json"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
@@ -134,8 +135,11 @@ PLUGIN_SOURCE_PATH="./plugins/${PLUGIN_NAME}"
 
 if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
   INSTALL_ROOT="${REPO_ROOT}"
-  PLUGIN_SOURCE_PATH="${ROOT_CANONICAL}"
+  MARKETPLACE_ROOT="$(dirname "${ROOT_CANONICAL}")"
+  MARKETPLACE_PATH="${MARKETPLACE_ROOT}/.agents/plugins/marketplace.json"
+  PLUGIN_SOURCE_PATH="./$(basename "${ROOT_CANONICAL}")"
   say "Managed checkout: ${ROOT_CANONICAL}"
+  say "Marketplace root: ${MARKETPLACE_ROOT}"
   say "Marketplace plugin source: ${PLUGIN_SOURCE_PATH}"
 
   if [[ "${DRY_RUN}" == "1" ]]; then
@@ -347,7 +351,7 @@ raise SystemExit(0)
 
 if command -v codex >/dev/null 2>&1; then
   if [[ "${DRY_RUN}" == "1" ]]; then
-    say "[DRY-RUN] would ensure marketplace 'mercurai-local-plugins' is configured from ${HOME}"
+    say "[DRY-RUN] would ensure marketplace 'mercurai-local-plugins' is configured from ${MARKETPLACE_ROOT}"
     say "[DRY-RUN] would run: codex plugin add cc-conversation-search@mercurai-local-plugins --json"
     if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
       say "[DRY-RUN] would verify Codex JSON state is enabled with source ${PLUGIN_SOURCE_PATH}"
@@ -355,14 +359,14 @@ if command -v codex >/dev/null 2>&1; then
   else
     expected_marketplace_root=""
     if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
-      expected_marketplace_root="$(canonical_path "${HOME}")"
+      expected_marketplace_root="$(canonical_path "${MARKETPLACE_ROOT}")"
     fi
     if ! codex_marketplace_ready "${expected_marketplace_root}"; then
       if [[ "${MANAGED_CHECKOUT}" == "1" ]] \
         && codex_marketplace_ready ""; then
         codex plugin marketplace remove mercurai-local-plugins
       fi
-      codex plugin marketplace add "${HOME}" --json
+      codex plugin marketplace add "${MARKETPLACE_ROOT}" --json
     fi
 
     expected_plugin_source=""
