@@ -1,7 +1,7 @@
 [project]
 name = "cc-conversation-search"
 version = "0.6.0"
-description = "Find and resume Claude Code conversations using smart hybrid extraction and JIT indexing"
+description = "Find, resume, and mine Claude Code and Codex conversations"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []

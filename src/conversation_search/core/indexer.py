@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Conversation Search Indexer
-Scans ~/.claude/projects and indexes conversations with batch AI summarization
+Scans selected Claude Code and Codex transcript roots and indexes conversations
 """
 
 import json
@@ -12,6 +12,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from importlib.resources import files
+from conversation_search.core.providers import (
+    SUPPORTED_PROVIDERS,
+    detect_transcript_provider,
+    get_provider,
+)
 from conversation_search.core.summarization import (
     MessageSummarizer,
     is_summarizer_conversation,
@@ -39,7 +44,14 @@ class ConversationIndexer:
     def _init_db(self):
         """Initialize database with schema and run migrations"""
         schema_sql = files('conversation_search.data').joinpath('schema.sql').read_text()
-        self.conn.executescript(schema_sql)
+        existing_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if existing_columns and "provider" not in existing_columns:
+            self._migrate_provider_schema(schema_sql, existing_columns)
+        else:
+            self.conn.executescript(schema_sql)
 
         # Migration: Add is_meta_conversation if missing (for existing databases)
         try:
@@ -52,6 +64,86 @@ class ConversationIndexer:
             pass  # Column already exists
 
         self.conn.commit()
+
+    def _migrate_provider_schema(self, schema_sql: str, message_columns: set) -> None:
+        """Upgrade a v1 Claude-only database without losing indexed content."""
+        foreign_keys_enabled = self.conn.execute(
+            "PRAGMA foreign_keys"
+        ).fetchone()[0]
+        meta_expression = (
+            "is_meta_conversation"
+            if "is_meta_conversation" in message_columns
+            else "FALSE"
+        )
+        schema_without_pragmas = "\n".join(
+            line
+            for line in schema_sql.splitlines()
+            if not line.lstrip().upper().startswith("PRAGMA ")
+        )
+        drop_objects = """
+            DROP TRIGGER IF EXISTS messages_ai;
+            DROP TRIGGER IF EXISTS messages_ad;
+            DROP TRIGGER IF EXISTS messages_au;
+            DROP TABLE IF EXISTS message_content_fts;
+            DROP INDEX IF EXISTS idx_parent_uuid;
+            DROP INDEX IF EXISTS idx_session_id;
+            DROP INDEX IF EXISTS idx_timestamp;
+            DROP INDEX IF EXISTS idx_project_path;
+            DROP INDEX IF EXISTS idx_is_summarized;
+            DROP INDEX IF EXISTS idx_is_tool_noise;
+            DROP INDEX IF EXISTS idx_is_meta_conversation;
+            DROP INDEX IF EXISTS idx_conv_project;
+            DROP INDEX IF EXISTS idx_conv_last_message;
+        """
+        copy_sql = f"""
+            INSERT INTO conversations (
+                provider, session_id, project_path, conversation_file,
+                root_message_uuid, leaf_message_uuid, conversation_summary,
+                first_message_at, last_message_at, message_count, indexed_at
+            )
+            SELECT
+                'claude', session_id, project_path, conversation_file,
+                root_message_uuid, leaf_message_uuid, conversation_summary,
+                first_message_at, last_message_at, message_count, indexed_at
+            FROM conversations_v1;
+
+            INSERT INTO messages (
+                provider, message_uuid, session_id, parent_uuid, is_sidechain,
+                depth, timestamp, message_type, project_path, conversation_file,
+                summary, full_content, is_summarized, is_tool_noise,
+                is_meta_conversation, summary_method, indexed_at
+            )
+            SELECT
+                'claude', message_uuid, session_id, parent_uuid, is_sidechain,
+                depth, timestamp, message_type, project_path, conversation_file,
+                summary, full_content, is_summarized, is_tool_noise,
+                {meta_expression}, summary_method, indexed_at
+            FROM messages_v1;
+
+            DROP TABLE messages_v1;
+            DROP TABLE conversations_v1;
+            PRAGMA user_version=2;
+        """
+        try:
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            self.conn.executescript(
+                "BEGIN IMMEDIATE;\n"
+                + drop_objects
+                + "\nALTER TABLE messages RENAME TO messages_v1;\n"
+                + "ALTER TABLE conversations RENAME TO conversations_v1;\n"
+                + schema_without_pragmas
+                + copy_sql
+                + "\nCOMMIT;\n"
+            )
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.execute(
+                f"PRAGMA foreign_keys={'ON' if foreign_keys_enabled else 'OFF'}"
+            )
+        if not self.quiet:
+            print("  Migrated database: added Claude/Codex provider identities")
 
     def _get_summarizer_project_hash(self) -> Optional[str]:
         """Get the project hash for summarizer workspace by detection"""
@@ -80,7 +172,12 @@ class ConversationIndexer:
 
         return None
 
-    def scan_conversations(self, days_back: Optional[int] = 1) -> List[Path]:
+    def scan_conversations(
+        self,
+        days_back: Optional[int] = 1,
+        providers: Tuple[str, ...] = ("claude",),
+        provider_roots: Optional[Dict[str, Path]] = None,
+    ) -> List[Path]:
         """
         Scan ~/.claude/projects for conversation files
 
@@ -90,58 +187,84 @@ class ConversationIndexer:
         Returns:
             List of paths to JSONL files
         """
-        projects_dir = Path.home() / ".claude" / "projects"
-        if not projects_dir.exists():
-            if not self.quiet:
-                print(f"Projects directory not found: {projects_dir}")
-            return []
-
         cutoff_time = None
         if days_back is not None:
             cutoff_time = datetime.now() - timedelta(days=days_back)
 
-        # Get summarizer hash
-        summarizer_hash = self._get_summarizer_project_hash()
-
+        invalid = set(providers) - set(SUPPORTED_PROVIDERS)
+        if invalid:
+            raise ValueError(f"Unsupported transcript provider(s): {sorted(invalid)}")
+        roots = {
+            "claude": Path.home() / ".claude" / "projects",
+            "codex": Path.home() / ".codex" / "sessions",
+        }
+        roots.update(provider_roots or {})
         conversation_files = []
 
-        for project_dir in projects_dir.iterdir():
-            if not project_dir.is_dir():
-                continue
-
-            # Skip summarizer project
-            if summarizer_hash and project_dir.name == summarizer_hash:
-                continue
-
-            for conv_file in project_dir.glob("*.jsonl"):
-                # Skip agent files
-                if conv_file.stem.startswith("agent-"):
-                    continue
-
-                # Check modification time
-                if cutoff_time:
-                    mtime = datetime.fromtimestamp(conv_file.stat().st_mtime)
-                    if mtime < cutoff_time:
+        if "claude" in providers:
+            projects_dir = roots["claude"]
+            if not projects_dir.exists():
+                if not self.quiet:
+                    print(f"Projects directory not found: {projects_dir}")
+            else:
+                summarizer_hash = self._get_summarizer_project_hash()
+                for project_dir in projects_dir.iterdir():
+                    if not project_dir.is_dir():
                         continue
+                    if summarizer_hash and project_dir.name == summarizer_hash:
+                        continue
+                    for conv_file in project_dir.glob("*.jsonl"):
+                        if conv_file.stem.startswith("agent-"):
+                            continue
+                        if cutoff_time:
+                            mtime = datetime.fromtimestamp(conv_file.stat().st_mtime)
+                            if mtime < cutoff_time:
+                                continue
+                        conversation_files.append(conv_file)
 
-                conversation_files.append(conv_file)
+        if "codex" in providers:
+            codex_root = roots["codex"]
+            if not codex_root.exists():
+                if not self.quiet:
+                    print(f"Sessions directory not found: {codex_root}")
+            else:
+                for conv_file in codex_root.rglob("*.jsonl"):
+                    if cutoff_time:
+                        mtime = datetime.fromtimestamp(conv_file.stat().st_mtime)
+                        if mtime < cutoff_time:
+                            continue
+                    conversation_files.append(conv_file)
 
-        return sorted(conversation_files, key=lambda p: p.stat().st_mtime, reverse=True)
+        return sorted(
+            set(conversation_files),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
 
-    def parse_conversation_file(self, file_path: Path) -> Tuple[Dict, List[Dict]]:
+    def parse_conversation_file(
+        self,
+        file_path: Path,
+        provider: str = "claude",
+    ) -> Tuple[Dict, List[Dict]]:
         """
-        Parse a conversation JSONL file
-
-        Returns:
-            (conversation_metadata, messages_list)
+        Parse a provider transcript into the common conversation/message shape.
         """
+        if provider == "codex":
+            return get_provider(provider).conversation(file_path)
+        if provider != "claude":
+            raise ValueError(f"Unsupported transcript provider: {provider}")
+
         messages = []
         conversation_meta = None
+        session_id = None
+        project_path = None
 
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
                 try:
                     data = json.loads(line.strip())
+                    session_id = session_id or data.get("sessionId")
+                    project_path = project_path or data.get("cwd")
 
                     # First line is the summary
                     if line_num == 1 and data.get('type') == 'summary':
@@ -168,7 +291,6 @@ class ConversationIndexer:
                                     elif block.get('type') == 'tool_use':
                                         tool_name = block.get('name', 'unknown')
                                         text_parts.append(f"[Tool: {tool_name}]")
-                                        # Include tool input for detection (especially for Bash commands)
                                         tool_input = block.get('input', {})
                                         if isinstance(tool_input, dict) and 'command' in tool_input:
                                             text_parts.append(tool_input['command'])
@@ -191,7 +313,15 @@ class ConversationIndexer:
                         print(f"Error parsing line {line_num} in {file_path}: {e}")
                     continue
 
-        return conversation_meta, messages
+        metadata = dict(conversation_meta or {})
+        metadata.update(
+            {
+                "provider": "claude",
+                "session_id": session_id or (messages[0].get("session_id") if messages else None),
+                "project_path": project_path,
+            }
+        )
+        return metadata, messages
 
     def calculate_depth(self, messages: List[Dict], parent_map: Dict[str, str]) -> Dict[str, int]:
         """Calculate depth of each message from root"""
@@ -349,13 +479,18 @@ class ConversationIndexer:
 
         return meta_uuids
 
-    def index_conversation(self, file_path: Path, summarize: bool = True):
+    def index_conversation(
+        self,
+        file_path: Path,
+        summarize: bool = True,
+        provider: str = "claude",
+    ):
         """Index a single conversation file with batch summarization"""
         if not self.quiet:
             print(f"Indexing: {file_path}")
 
         # Parse file
-        conv_meta, messages = self.parse_conversation_file(file_path)
+        conv_meta, messages = self.parse_conversation_file(file_path, provider=provider)
 
         if not messages:
             if not self.quiet:
@@ -363,7 +498,7 @@ class ConversationIndexer:
             return
 
         # Skip summarizer conversations
-        if is_summarizer_conversation(file_path, messages):
+        if provider == "claude" and is_summarizer_conversation(file_path, messages):
             if not self.quiet:
                 print(f"  ⏭️  Skipping automated summarizer conversation")
             return
@@ -375,10 +510,14 @@ class ConversationIndexer:
             print(f"  🏷️  Marking {len(meta_uuids)} meta-search messages (~{pair_count} pairs)")
 
         # Extract project path from file location
-        project_path = file_path.parent.name.replace('-', '/')
+        project_path = (
+            conv_meta.get("project_path")
+            or get_provider(provider).project_path(file_path)
+            or str(file_path.parent)
+        )
 
         # Get session ID from first message
-        session_id = messages[0].get('session_id')
+        session_id = conv_meta.get("session_id") or messages[0].get('session_id')
         if not session_id:
             if not self.quiet:
                 print(f"  No session_id found in {file_path}")
@@ -393,8 +532,8 @@ class ConversationIndexer:
 
         # Check if already indexed
         cursor.execute(
-            "SELECT indexed_at FROM conversations WHERE session_id = ?",
-            (session_id,)
+            "SELECT indexed_at FROM conversations WHERE provider = ? AND session_id = ?",
+            (provider, session_id)
         )
         existing = cursor.fetchone()
 
@@ -405,8 +544,8 @@ class ConversationIndexer:
 
             # Get existing message UUIDs
             cursor.execute(
-                "SELECT message_uuid FROM messages WHERE session_id = ?",
-                (session_id,)
+                "SELECT message_uuid FROM messages WHERE provider = ? AND session_id = ?",
+                (provider, session_id)
             )
             existing_uuids = {row['message_uuid'] for row in cursor.fetchall()}
 
@@ -433,11 +572,12 @@ class ConversationIndexer:
                     message_count = ?,
                     leaf_message_uuid = ?,
                     indexed_at = CURRENT_TIMESTAMP
-                WHERE session_id = ?
+                WHERE provider = ? AND session_id = ?
             """, (
                 all_messages[-1]['timestamp'],
                 len(existing_uuids) + len(new_messages),
                 conv_meta.get('leafUuid') if conv_meta else None,
+                provider,
                 session_id
             ))
         else:
@@ -446,11 +586,12 @@ class ConversationIndexer:
 
             cursor.execute("""
                 INSERT INTO conversations (
-                    session_id, project_path, conversation_file,
+                    provider, session_id, project_path, conversation_file,
                     root_message_uuid, leaf_message_uuid, conversation_summary,
                     first_message_at, last_message_at, message_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
+                provider,
                 session_id,
                 project_path,
                 str(file_path),
@@ -473,12 +614,13 @@ class ConversationIndexer:
             for message in messages:
                 cursor.execute("""
                     INSERT INTO messages (
-                        message_uuid, session_id, parent_uuid, is_sidechain,
+                        provider, message_uuid, session_id, parent_uuid, is_sidechain,
                         depth, timestamp, message_type, project_path,
                         conversation_file, full_content, is_meta_conversation,
                         is_tool_noise
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
+                    provider,
                     message['uuid'],
                     session_id,
                     message['parent_uuid'],
@@ -511,9 +653,14 @@ class ConversationIndexer:
                 print(f"  Error during indexing, rolled back: {e}")
             raise
 
-    def index_all(self, days_back: Optional[int] = 1, summarize: bool = True):
+    def index_all(
+        self,
+        days_back: Optional[int] = 1,
+        summarize: bool = True,
+        providers: Tuple[str, ...] = ("claude",),
+    ):
         """Index all conversations from the last N days"""
-        files = self.scan_conversations(days_back)
+        files = self.scan_conversations(days_back, providers=providers)
         if not self.quiet:
             print(f"Found {len(files)} conversation files to index")
 
@@ -521,7 +668,16 @@ class ConversationIndexer:
             if not self.quiet:
                 print(f"\n[{i}/{len(files)}]")
             try:
-                self.index_conversation(file_path, summarize=summarize)
+                provider = (
+                    providers[0]
+                    if len(providers) == 1
+                    else detect_transcript_provider(file_path)
+                )
+                self.index_conversation(
+                    file_path,
+                    summarize=summarize,
+                    provider=provider,
+                )
             except Exception as e:
                 if not self.quiet:
                     print(f"  Error indexing {file_path}: {e}")

@@ -1,11 +1,12 @@
 ---
 name: claude-session-miner
-description: Inspect, resolve, and mine Claude Code session transcripts by session ID or transcript path using cc-conversation-search first, then local transcript and research fallbacks.
+description: Backward-compatible Claude-only alias for the provider-aware session-miner skill.
 ---
 
-# Claude Session Miner
+# Claude Session Miner (Compatibility Alias)
 
-Use this skill when asked to inspect, review, mine, summarize, or recover context from a Claude Code session ID, a local Claude transcript, project session history, a tool-call log, or an agent/subagent transcript.
+Prefer the provider-aware `session-miner` skill for new work. This alias
+preserves existing Claude workflows and always passes `--provider claude`.
 
 ## Workflow
 
@@ -14,16 +15,16 @@ Use this skill when asked to inspect, review, mine, summarize, or recover contex
    - If the tool is missing or stale, run the repo installer:
      - `bash install.sh`
    - For session IDs, use:
-     - `cc-conversation-search tree <session-id> --json`
+     - `cc-conversation-search tree <session-id> --provider claude --json`
    - Treat JSON containing `"error"` as unresolved even when the command exits `0`.
 2. For broader topic lookup, use:
-   - `cc-conversation-search search "<topic>" --json --limit 20`
-   - `cc-conversation-search context <message-uuid> --json --content`
+   - `cc-conversation-search search "<topic>" --provider claude --json --limit 20`
+   - `cc-conversation-search context <message-uuid> --provider claude --json --content`
 3. For transcript mining and local fallback, use:
-   - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id>` — text report
-   - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id> --json` — structured machine-readable output (`schema_version: 1`)
+   - `cc-conversation-search mine-session <session-id> --provider claude` — text report
+   - `cc-conversation-search mine-session <session-id> --provider claude --json` — structured machine-readable output (`schema_version: 1`)
    - If an explicit transcript path was provided:
-     - `python codex-skills/claude-session-miner/scripts/mine_claude_session.py <session-id> --transcript "<path-to-jsonl>" [--json]`
+     - `cc-conversation-search mine-session <session-id> --provider claude --transcript "<path-to-jsonl>" [--json]`
    - The `--json` flag flows through both the wrapper script and the package CLI (`cc-conversation-search mine-session ... --json`); both produce identical output for identical args.
 4. Prefer evidence from the actual Claude transcript over secondary logs or summaries.
 
@@ -35,7 +36,8 @@ the Claude-side `conversation-search` skill; both must agree.
 - **`tree` is for session IDs.** Use `cc-conversation-search tree <session-id> --json` for ID lookup.
 - **`tree` JSON containing an `error` field is unresolved**, even when the command exits `0`.
 - **Explicit transcript path is the preferred fallback** when the index is stale or unavailable. Pass `--transcript "<path>"`.
-- **Codex-side filename matches are evidence-only.** Encountering the session ID inside a Codex transcript or store does NOT count as resolution.
+- **Codex-side filename matches are evidence-only.** Encountering the session
+  ID inside a Codex transcript or store does not resolve a Claude session.
 - `resume` expects a message UUID, not a session UUID.
 - Report from evidence only.
 

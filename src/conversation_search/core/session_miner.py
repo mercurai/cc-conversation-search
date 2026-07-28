@@ -53,9 +53,16 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from conversation_search.core.providers import (
+    SUPPORTED_PROVIDERS,
+    detect_transcript_provider,
+    get_provider,
+)
+
 # Schema version for the structured `mine_session()` / `mine-session --json`
 # output contract. Bump on breaking changes; subkey additions are additive.
 SCHEMA_VERSION = 1
+MAX_EVIDENCE_ITEMS = 200
 
 # Ordered resolution stages. `codex_filename_matches` is intentionally NOT
 # present in this list — Codex-side filename matches are evidence only.
@@ -82,6 +89,15 @@ def add_mine_session_args(parser):
         dest="json_output",
         action="store_true",
         help="Emit the structured mine_session() result as JSON instead of the text report.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=(*SUPPORTED_PROVIDERS, "auto"),
+        default="claude",
+        help=(
+            "Transcript producer to mine (default: claude). "
+            "Use auto only for structurally detectable explicit transcripts."
+        ),
     )
     return parser
 
@@ -337,7 +353,13 @@ def _extract_tree_conversation(tree_result):
 # Stages 2/3: explicit path and raw Claude transcript search
 # ---------------------------------------------------------------------------
 
-def find_transcript_candidates(session_id, explicit_path=None, claude_root=None, codex_roots=None):
+def find_transcript_candidates(
+    session_id,
+    explicit_path=None,
+    claude_root=None,
+    codex_roots=None,
+    provider="claude",
+):
     """Walk the explicit path, ~/.claude/projects, and Codex-side stores.
 
     Codex matches are returned as `codex_filename_matches` and are never
@@ -363,20 +385,21 @@ def find_transcript_candidates(session_id, explicit_path=None, claude_root=None,
     if claude_root is None:
         claude_root = Path.home() / ".claude" / "projects"
     claude_root = Path(claude_root)
-    checked.append(str(claude_root))
     claude_matches = []
-    if claude_root.exists():
+    if provider in {"claude", "auto"}:
+        checked.append(str(claude_root))
+    if provider in {"claude", "auto"} and claude_root.exists():
         for match in claude_root.rglob(f"{session_id}.jsonl"):
             if match.is_file():
                 resolved.append(match.resolve())
                 claude_matches.append(match.resolve())
 
     if codex_roots is None:
-        codex_roots = [
-            Path.home() / ".codex",
-            Path.home() / ".agents",
-            Path.home() / "AppData" / "Roaming" / "Codex",
-        ]
+        # Codex transcripts live under this bounded root. Avoid recursively
+        # walking configuration, skill, cache, and roaming-data directories.
+        codex_roots = [Path.home() / ".codex" / "sessions"]
+    # Claude mode retains Codex filename hits as evidence-only for backward
+    # compatibility, but never promotes them to resolution.
     for root in codex_roots:
         root = Path(root)
         checked.append(str(root))
@@ -401,7 +424,13 @@ def find_transcript_candidates(session_id, explicit_path=None, claude_root=None,
 # Public stage-based resolver
 # ---------------------------------------------------------------------------
 
-def resolve_session(session_id, explicit_path=None, claude_root=None, codex_roots=None):
+def resolve_session(
+    session_id,
+    explicit_path=None,
+    claude_root=None,
+    codex_roots=None,
+    provider="claude",
+):
     """Run all four resolution stages and return a stable dict.
 
     Schema:
@@ -423,34 +452,75 @@ def resolve_session(session_id, explicit_path=None, claude_root=None, codex_root
 
     `claude_root` and `codex_roots` exist for testability.
     """
-    tree_result = run_cc_tree(session_id)
+    if provider not in (*SUPPORTED_PROVIDERS, "auto"):
+        raise ValueError(f"Unsupported transcript provider: {provider}")
+
+    requested_provider = provider
+    tree_result = (
+        run_cc_tree(session_id)
+        if provider in {"claude", "auto"}
+        else {
+            "status": "skipped",
+            "checked": [],
+            "error": None,
+        }
+    )
     candidates = find_transcript_candidates(
         session_id, explicit_path,
         claude_root=claude_root,
         codex_roots=codex_roots,
+        provider=provider,
     )
     tree_conv = _extract_tree_conversation(tree_result)
 
     resolved_path = None
     resolution_stage = None
+    resolved_provider = None
 
-    if tree_conv:
+    if tree_conv and provider in {"claude", "auto"}:
         candidate = canonicalize_path(tree_conv.get("conversation_file"))
         if candidate and candidate.is_file():
             resolved_path = candidate
             resolution_stage = "tree"
+            resolved_provider = "claude"
 
     if resolved_path is None and candidates["explicit"]["exists"]:
-        resolved_path = canonicalize_path(candidates["explicit"]["path"])
-        resolution_stage = "explicit"
+        explicit_candidate = canonicalize_path(candidates["explicit"]["path"])
+        explicit_provider = provider
+        if provider == "auto":
+            explicit_provider = detect_transcript_provider(explicit_candidate)
+        adapter = get_provider(explicit_provider)
+        # Preserve the legacy Claude behavior: an explicit path is authoritative.
+        if explicit_provider == "claude" or adapter.matches_session(explicit_candidate, session_id):
+            resolved_path = explicit_candidate
+            resolution_stage = "explicit"
+            resolved_provider = explicit_provider
 
-    if resolved_path is None and candidates["claude_root_matches"]:
+    if (
+        resolved_path is None
+        and provider in {"claude", "auto"}
+        and candidates["claude_root_matches"]
+    ):
         resolved_path = candidates["claude_root_matches"][0]
         resolution_stage = "claude_root"
+        resolved_provider = "claude"
+
+    if resolved_path is None and provider in {"codex", "auto"}:
+        codex_provider = get_provider("codex")
+        for candidate in candidates["codex_filename_matches"]:
+            if codex_provider.matches_session(candidate, session_id):
+                resolved_path = candidate
+                resolution_stage = "codex_root"
+                resolved_provider = "codex"
+                break
 
     project_path_raw = tree_conv.get("project_path") if isinstance(tree_conv, dict) else None
     encoded_dir = resolved_path.parent.name if resolved_path else None
-    project_path = normalize_project_path(
+    if resolved_path and resolved_provider:
+        adapter_project_path = get_provider(resolved_provider).project_path(resolved_path)
+    else:
+        adapter_project_path = None
+    project_path = adapter_project_path or normalize_project_path(
         raw_value=project_path_raw,
         transcript_path=resolved_path,
         encoded_dir=encoded_dir,
@@ -458,6 +528,13 @@ def resolve_session(session_id, explicit_path=None, claude_root=None, codex_root
 
     return {
         "session_id": session_id,
+        "requested_provider": requested_provider,
+        "resolved_provider": resolved_provider,
+        "transcript_format": (
+            get_provider(resolved_provider).transcript_format
+            if resolved_provider
+            else None
+        ),
         "resolved": resolution_stage is not None,
         "resolved_path": str(resolved_path) if resolved_path else None,
         "resolution_stage": resolution_stage,
@@ -523,7 +600,7 @@ def extract_attachment_error(obj):
     return None
 
 
-def parse_transcript(path):
+def parse_claude_transcript(path):
     counts = Counter()
     tool_counts = Counter()
     attachment_counts = Counter()
@@ -639,6 +716,17 @@ def parse_transcript(path):
     }
 
 
+def parse_transcript(path, provider="claude"):
+    """Parse a transcript through the selected producer adapter.
+
+    The default remains Claude for backward compatibility. ``auto`` is allowed
+    only when the transcript itself can be identified structurally.
+    """
+    transcript = Path(path)
+    selected = detect_transcript_provider(transcript) if provider == "auto" else provider
+    return get_provider(selected).parse(transcript)
+
+
 # ---------------------------------------------------------------------------
 # Optional autoresearch / research-db lookups
 # ---------------------------------------------------------------------------
@@ -734,22 +822,39 @@ def _summary_to_json(summary: Optional[dict]) -> Optional[dict]:
     """Coerce a parse_transcript() return value into a JSON-clean dict."""
     if summary is None:
         return None
+    evidence_fields = {
+        "files_touched": list(
+            summary.get("files_touched", Counter()).most_common()
+        ),
+        "shell_commands": list(summary.get("shell_commands", [])),
+        "user_prompts": list(summary.get("user_prompts", [])),
+        "assistant_messages": list(summary.get("assistant_messages", [])),
+        "queue_summaries": list(summary.get("queue_summaries", [])),
+        "errors": list(summary.get("errors", [])),
+    }
     out = {
         "path": str(summary["path"]) if summary.get("path") else None,
+        "provider": summary.get("provider", "claude"),
+        "transcript_format": summary.get("transcript_format", "claude-jsonl"),
+        "session_id": summary.get("session_id"),
+        "project_path": summary.get("project_path"),
+        "provider_metadata": _jsonable(summary.get("provider_metadata", {})),
         "records": int(summary.get("records", 0)),
         "user_turns": int(summary.get("user_turns", 0)),
         "assistant_turns": int(summary.get("assistant_turns", 0)),
         "time_range": list(summary.get("time_range", (None, None))),
         "record_counts": _jsonable(summary.get("record_counts", Counter())),
+        "payload_counts": _jsonable(summary.get("payload_counts", Counter())),
         "attachment_counts": _jsonable(summary.get("attachment_counts", Counter())),
         "tool_counts": _jsonable(summary.get("tool_counts", Counter())),
         "files_touched": [
             {"path": str(p), "count": int(c)}
-            for p, c in summary.get("files_touched", Counter()).most_common()
+            for p, c in evidence_fields["files_touched"][:MAX_EVIDENCE_ITEMS]
         ],
-        "shell_commands": list(summary.get("shell_commands", [])),
-        "user_prompts": list(summary.get("user_prompts", [])),
-        "queue_summaries": list(summary.get("queue_summaries", [])),
+        "shell_commands": evidence_fields["shell_commands"][:MAX_EVIDENCE_ITEMS],
+        "user_prompts": evidence_fields["user_prompts"][:MAX_EVIDENCE_ITEMS],
+        "assistant_messages": evidence_fields["assistant_messages"][:MAX_EVIDENCE_ITEMS],
+        "queue_summaries": evidence_fields["queue_summaries"][:MAX_EVIDENCE_ITEMS],
         "errors": [
             {
                 "timestamp": e.get("timestamp"),
@@ -759,8 +864,13 @@ def _summary_to_json(summary: Optional[dict]) -> Optional[dict]:
                 "stderr": e.get("stderr") if isinstance(e.get("stderr"), (str, type(None))) else str(e.get("stderr")),
                 "exit_code": e.get("exit_code"),
             }
-            for e in summary.get("errors", [])
+            for e in evidence_fields["errors"][:MAX_EVIDENCE_ITEMS]
         ],
+        "evidence_limit": MAX_EVIDENCE_ITEMS,
+        "evidence_truncated": {
+            key: len(values) > MAX_EVIDENCE_ITEMS
+            for key, values in evidence_fields.items()
+        },
     }
     return out
 
@@ -794,7 +904,11 @@ _RECOMMENDATIONS = (
 # mine_session: single source of structured truth
 # ---------------------------------------------------------------------------
 
-def mine_session(session_id: str, transcript: Optional[str] = None) -> dict:
+def mine_session(
+    session_id: str,
+    transcript: Optional[str] = None,
+    provider: str = "claude",
+) -> dict:
     """Run the full mining pipeline and return a fully JSON-serializable dict.
 
     Both `build_report` (text mode) and `run_mine_session` (--json mode)
@@ -811,9 +925,16 @@ def mine_session(session_id: str, transcript: Optional[str] = None) -> dict:
           "recommendations": [ "...", ... ]
         }
     """
-    resolution = resolve_session(session_id, transcript)
+    resolution = resolve_session(session_id, transcript, provider=provider)
     resolved_path = Path(resolution["resolved_path"]) if resolution["resolved_path"] else None
-    summary_raw = parse_transcript(resolved_path) if resolved_path else None
+    summary_raw = (
+        parse_transcript(
+            resolved_path,
+            provider=resolution.get("resolved_provider") or provider,
+        )
+        if resolved_path
+        else None
+    )
     db_paths = [
         Path.home() / ".claude" / "research.db",
         Path.home() / ".claude" / "skills" / "autoresearch" / "research.db",
@@ -824,6 +945,9 @@ def mine_session(session_id: str, transcript: Optional[str] = None) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
+        "requested_provider": provider,
+        "resolved_provider": resolution.get("resolved_provider"),
+        "transcript_format": resolution.get("transcript_format"),
         "resolution": _jsonable(resolution),
         "summary": _summary_to_json(summary_raw),
         "db_signals": db_results,
@@ -835,8 +959,8 @@ def mine_session(session_id: str, transcript: Optional[str] = None) -> dict:
 # Human-readable report (built from mine_session() output)
 # ---------------------------------------------------------------------------
 
-def build_report(session_id, transcript=None):
-    data = mine_session(session_id, transcript)
+def build_report(session_id, transcript=None, provider="claude"):
+    data = mine_session(session_id, transcript, provider=provider)
     resolution = data["resolution"]
     tree_metadata = resolution.get("tree_metadata")
     summary = data["summary"]
@@ -851,6 +975,8 @@ def build_report(session_id, transcript=None):
     lines = []
     lines.extend(["Resolution", "-" * len("Resolution")])
     lines.append(f"Session ID: {session_id}")
+    lines.append(f"Requested provider: {data['requested_provider']}")
+    lines.append(f"Resolved provider: {data['resolved_provider'] or '(not found)'}")
     lines.append(f"cc-conversation-search status: {resolution['stages']['tree']['status']}")
     if resolution["stages"]["tree"].get("error"):
         lines.append(f"cc-conversation-search detail: {resolution['stages']['tree']['error']}")
@@ -952,8 +1078,13 @@ def build_report(session_id, transcript=None):
 # Shared execution surface
 # ---------------------------------------------------------------------------
 
-def run_mine_session(session_id: str, transcript: Optional[str] = None,
-                     json_output: bool = False, stream=None) -> int:
+def run_mine_session(
+    session_id: str,
+    transcript: Optional[str] = None,
+    json_output: bool = False,
+    stream=None,
+    provider: str = "claude",
+) -> int:
     """Render the mine-session result.
 
     Both `cli.py`'s `cmd_mine_session` and `session_miner.main()` call this
@@ -961,13 +1092,13 @@ def run_mine_session(session_id: str, transcript: Optional[str] = None,
     """
     out = stream if stream is not None else sys.stdout
     if json_output:
-        data = mine_session(session_id, transcript)
+        data = mine_session(session_id, transcript, provider=provider)
         # No default= — if a non-serializable type leaks through, surface it
         # as a hard failure rather than silently stringify.
         out.write(json.dumps(data, indent=2))
         out.write("\n")
     else:
-        out.write(build_report(session_id, transcript))
+        out.write(build_report(session_id, transcript, provider=provider))
         out.write("\n")
     return 0
 
@@ -975,4 +1106,9 @@ def run_mine_session(session_id: str, transcript: Optional[str] = None,
 def main(argv=None):
     configure_stdio()
     args = parse_args(argv)
-    return run_mine_session(args.session_id, args.transcript, json_output=args.json_output)
+    return run_mine_session(
+        args.session_id,
+        args.transcript,
+        json_output=args.json_output,
+        provider=args.provider,
+    )

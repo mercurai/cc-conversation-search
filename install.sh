@@ -251,6 +251,59 @@ PY
 fi
 
 # ---------------------------------------------------------------------------
+# Codex marketplace activation
+# ---------------------------------------------------------------------------
+
+if command -v codex >/dev/null 2>&1; then
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    say "[DRY-RUN] would ensure marketplace 'mercurai-local-plugins' is configured from ${HOME}"
+    say "[DRY-RUN] would run: codex plugin add cc-conversation-search@mercurai-local-plugins --json"
+  else
+    if ! codex plugin marketplace list --json | python -c '
+import json
+import sys
+data = json.load(sys.stdin)
+names = {item.get("name") for item in data.get("marketplaces", [])}
+raise SystemExit(0 if "mercurai-local-plugins" in names else 1)
+'; then
+      codex plugin marketplace add "${HOME}" --json
+    fi
+
+    # `plugin add` records the plugin in Codex config with enabled=true.
+    if codex plugin list --json | python -c '
+import json
+import sys
+data = json.load(sys.stdin)
+matches = [
+    item for item in data.get("installed", [])
+    if item.get("pluginId") == "cc-conversation-search@mercurai-local-plugins"
+]
+raise SystemExit(0 if matches and matches[0].get("enabled") is True else 1)
+'; then
+      say "Codex plugin is already installed and enabled."
+    else
+      codex plugin add cc-conversation-search@mercurai-local-plugins --json
+    fi
+
+    if ! codex plugin list --json | python -c '
+import json
+import sys
+data = json.load(sys.stdin)
+matches = [
+    item for item in data.get("installed", [])
+    if item.get("pluginId") == "cc-conversation-search@mercurai-local-plugins"
+]
+raise SystemExit(0 if matches and matches[0].get("enabled") is True else 1)
+'; then
+      say "ERROR: Codex plugin was not reported as installed and enabled."
+      exit 1
+    fi
+  fi
+else
+  say "Codex CLI not found; marketplace entry was written but activation was skipped."
+fi
+
+# ---------------------------------------------------------------------------
 # Post-install verification
 # ---------------------------------------------------------------------------
 

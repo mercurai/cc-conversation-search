@@ -308,6 +308,7 @@ def test_resolve_session_schema_is_stable(tmp_path, monkeypatch):
     expected_keys = {
         "session_id", "resolved", "resolved_path", "resolution_stage",
         "stages", "tree_metadata", "project_path", "project_path_raw",
+        "requested_provider", "resolved_provider", "transcript_format",
     }
     assert set(out.keys()) == expected_keys
     assert set(out["stages"].keys()) == {
@@ -387,6 +388,7 @@ def test_mine_session_unresolved_returns_full_schema(tmp_path, monkeypatch):
     assert set(out.keys()) == {
         "schema_version", "session_id", "resolution",
         "summary", "db_signals", "recommendations",
+        "requested_provider", "resolved_provider", "transcript_format",
     }
     assert out["resolution"]["resolved"] is False
     assert out["summary"] is None

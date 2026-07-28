@@ -1,5 +1,5 @@
--- Claude Finder Database Schema
--- Stores indexed conversation data with tree structure
+-- Provider-aware Conversation Search database schema
+-- Stores Claude Code and Codex conversation data with tree structure
 
 -- Enable WAL mode for better concurrent access (prevents corruption)
 PRAGMA journal_mode=WAL;
@@ -7,7 +7,9 @@ PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS messages (
     -- Identity
-    message_uuid TEXT PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'claude'
+        CHECK(provider IN ('claude', 'codex')),
+    message_uuid TEXT NOT NULL,
     session_id TEXT NOT NULL,
 
     -- Tree structure
@@ -34,12 +36,18 @@ CREATE TABLE IF NOT EXISTS messages (
     -- Indexing
     indexed_at TEXT DEFAULT CURRENT_TIMESTAMP,
 
-    FOREIGN KEY (parent_uuid) REFERENCES messages(message_uuid)
+    PRIMARY KEY (provider, message_uuid),
+    FOREIGN KEY (provider, parent_uuid)
+        REFERENCES messages(provider, message_uuid),
+    FOREIGN KEY (provider, session_id)
+        REFERENCES conversations(provider, session_id)
 );
 
 -- Index for tree traversal
 CREATE INDEX IF NOT EXISTS idx_parent_uuid ON messages(parent_uuid);
 CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_message_provider_session
+    ON messages(provider, session_id);
 CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_project_path ON messages(project_path);
 CREATE INDEX IF NOT EXISTS idx_is_summarized ON messages(is_summarized);
@@ -72,7 +80,9 @@ END;
 
 -- Conversation metadata (one per session)
 CREATE TABLE IF NOT EXISTS conversations (
-    session_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'claude'
+        CHECK(provider IN ('claude', 'codex')),
+    session_id TEXT NOT NULL,
     project_path TEXT,
     conversation_file TEXT,
     root_message_uuid TEXT,
@@ -83,10 +93,12 @@ CREATE TABLE IF NOT EXISTS conversations (
     message_count INTEGER DEFAULT 0,
     indexed_at TEXT DEFAULT CURRENT_TIMESTAMP,
 
-    FOREIGN KEY (root_message_uuid) REFERENCES messages(message_uuid)
+    PRIMARY KEY (provider, session_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_path);
+CREATE INDEX IF NOT EXISTS idx_conv_provider
+    ON conversations(provider, last_message_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conv_last_message ON conversations(last_message_at DESC);
 
 -- Processing queue for new/updated files

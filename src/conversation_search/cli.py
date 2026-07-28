@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Union
 
 from conversation_search.core.indexer import ConversationIndexer
+from conversation_search.core.providers import detect_transcript_provider, get_provider
 from conversation_search.core.search import ConversationSearch, format_timestamp
 from conversation_search.core.session_miner import (
     add_mine_session_args,
@@ -25,6 +26,21 @@ except PackageNotFoundError:
 # Configurable Claude command (default: 'claude')
 # Set CC_CONVERSATION_SEARCH_CMD env var to override (e.g., 'clauded' for alias)
 CLAUDE_CMD = os.environ.get('CC_CONVERSATION_SEARCH_CMD', 'claude')
+
+
+def _selected_providers(args) -> tuple[str, ...]:
+    provider = getattr(args, "provider", "claude")
+    return ("claude", "codex") if provider == "all" else (provider,)
+
+
+def _provider_for_path(path: Path, providers: tuple[str, ...]) -> str:
+    return providers[0] if len(providers) == 1 else detect_transcript_provider(path)
+
+
+def _resume_command(provider: str, session_id: str) -> str:
+    if provider == "claude":
+        return f"{CLAUDE_CMD} --resume {session_id}"
+    return get_provider(provider).resume_command(session_id)
 
 
 def localize_timestamps(data: Any) -> Any:
@@ -72,7 +88,8 @@ def cmd_init(args):
     days = args.days
     if not quiet:
         print(f"\nIndexing conversations from last {days} days...")
-    files = indexer.scan_conversations(days_back=days)
+    providers = _selected_providers(args)
+    files = indexer.scan_conversations(days_back=days, providers=providers)
 
     if not files:
         if not quiet:
@@ -87,7 +104,11 @@ def cmd_init(args):
         try:
             if not quiet:
                 print(f"  [{i}/{len(files)}] {conv_file.name}", end="\r")
-            indexer.index_conversation(conv_file, summarize=not args.no_extract)
+            indexer.index_conversation(
+                conv_file,
+                summarize=not args.no_extract,
+                provider=_provider_for_path(conv_file, providers),
+            )
         except Exception as e:
             print(f"\n  Error indexing {conv_file.name}: {e}")
 
@@ -109,7 +130,11 @@ def cmd_index(args):
     quiet = args.quiet
     indexer = ConversationIndexer(quiet=quiet)
 
-    files = indexer.scan_conversations(days_back=args.days if not args.all else None)
+    providers = _selected_providers(args)
+    files = indexer.scan_conversations(
+        days_back=args.days if not args.all else None,
+        providers=providers,
+    )
 
     if not files:
         if not quiet:
@@ -123,7 +148,11 @@ def cmd_index(args):
         try:
             if not quiet:
                 print(f"[{i}/{len(files)}] {conv_file.name}", end="\r")
-            indexer.index_conversation(conv_file, summarize=not args.no_extract)
+            indexer.index_conversation(
+                conv_file,
+                summarize=not args.no_extract,
+                provider=_provider_for_path(conv_file, providers),
+            )
         except Exception as e:
             if not quiet:
                 print(f"\nError indexing {conv_file.name}: {e}")
@@ -138,13 +167,21 @@ def cmd_search(args):
     # Auto-index before searching to ensure fresh data
     if not getattr(args, 'no_index', False):
         indexer = ConversationIndexer(quiet=True)
+        providers = _selected_providers(args)
         # Index at least as far back as search range, minimum 30 days
         days_to_index = max(args.days if args.days else 30, 30)
-        files = indexer.scan_conversations(days_back=days_to_index)
+        files = indexer.scan_conversations(
+            days_back=days_to_index,
+            providers=providers,
+        )
         if files:
             for conv_file in files:
                 try:
-                    indexer.index_conversation(conv_file, summarize=True)
+                    indexer.index_conversation(
+                        conv_file,
+                        summarize=True,
+                        provider=_provider_for_path(conv_file, providers),
+                    )
                 except Exception:
                     pass  # Silent failures for auto-indexing
         indexer.close()
@@ -159,7 +196,8 @@ def cmd_search(args):
             until=getattr(args, 'until', None),
             date=getattr(args, 'date', None),
             limit=args.limit,
-            project_path=args.project
+            project_path=args.project,
+            provider=None if args.provider == "all" else args.provider,
         )
     except Exception as e:
         print(f"Error: {e}")
@@ -179,10 +217,7 @@ def cmd_search(args):
         icon = "👤" if result['message_type'] == 'user' else "🤖"
         timestamp = format_timestamp(result['timestamp'])
 
-        # Convert project_path hash to actual path
-        project_dir = result['project_path'].replace('-', '/')
-        if not project_dir.startswith('/'):
-            project_dir = f"/{project_dir}"
+        project_dir = result['project_path']
 
         print(f"{icon}  {result['conversation_summary']}")
         print(f"   Session: {result['session_id']}")
@@ -191,7 +226,10 @@ def cmd_search(args):
         print(f"   Message: {result['message_uuid']}")
 
         if args.content:
-            content = search.get_full_message_content(result['message_uuid'])
+            content = search.get_full_message_content(
+                result['message_uuid'],
+                provider=result["provider"],
+            )
             if content:
                 print(f"\n   {content[:300]}...")
         else:
@@ -199,7 +237,7 @@ def cmd_search(args):
 
         print(f"\n   Resume:")
         print(f"     cd {project_dir}")
-        print(f"     {CLAUDE_CMD} --resume {result['session_id']}")
+        print(f"     {_resume_command(result['provider'], result['session_id'])}")
         print()
 
 
@@ -208,11 +246,16 @@ def cmd_context(args):
     # Auto-index recent conversations to ensure fresh data
     if not getattr(args, 'no_index', False):
         indexer = ConversationIndexer(quiet=True)
-        files = indexer.scan_conversations(days_back=30)
+        providers = _selected_providers(args)
+        files = indexer.scan_conversations(days_back=30, providers=providers)
         if files:
             for conv_file in files:
                 try:
-                    indexer.index_conversation(conv_file, summarize=True)
+                    indexer.index_conversation(
+                        conv_file,
+                        summarize=True,
+                        provider=_provider_for_path(conv_file, providers),
+                    )
                 except Exception:
                     pass  # Silent failures for auto-indexing
         indexer.close()
@@ -221,7 +264,8 @@ def cmd_context(args):
 
     result = search.get_conversation_context(
         message_uuid=args.uuid,
-        depth=args.depth
+        depth=args.depth,
+        provider=args.provider,
     )
 
     if args.json:
@@ -266,12 +310,20 @@ def cmd_list(args):
     # Auto-index before listing to ensure fresh data
     if not getattr(args, 'no_index', False):
         indexer = ConversationIndexer(quiet=True)
+        providers = _selected_providers(args)
         days_to_index = max(args.days if args.days else 30, 30)
-        files = indexer.scan_conversations(days_back=days_to_index)
+        files = indexer.scan_conversations(
+            days_back=days_to_index,
+            providers=providers,
+        )
         if files:
             for conv_file in files:
                 try:
-                    indexer.index_conversation(conv_file, summarize=True)
+                    indexer.index_conversation(
+                        conv_file,
+                        summarize=True,
+                        provider=_provider_for_path(conv_file, providers),
+                    )
                 except Exception:
                     pass  # Silent failures for auto-indexing
         indexer.close()
@@ -283,7 +335,8 @@ def cmd_list(args):
         since=getattr(args, 'since', None),
         until=getattr(args, 'until', None),
         date=getattr(args, 'date', None),
-        limit=args.limit
+        limit=args.limit,
+        provider=None if args.provider == "all" else args.provider,
     )
 
     if args.json:
@@ -309,7 +362,10 @@ def cmd_tree(args):
     """Show conversation tree"""
     search = ConversationSearch()
 
-    tree = search.get_conversation_tree(args.session_id)
+    tree = search.get_conversation_tree(
+        args.session_id,
+        provider=args.provider,
+    )
 
     if args.json:
         print(json.dumps(localize_timestamps(tree), indent=2))
@@ -340,13 +396,22 @@ def cmd_resume(args):
 
     # Get message info
     cursor = search.conn.cursor()
-    cursor.execute("""
-        SELECT m.session_id, m.project_path, m.timestamp, m.summary
-        FROM messages m
-        WHERE m.message_uuid = ?
-    """, (args.uuid,))
-
-    result = cursor.fetchone()
+    result = None
+    if search._has_provider:
+        cursor.execute("""
+            SELECT m.provider, m.session_id, m.project_path, m.timestamp, m.summary
+            FROM messages m
+            WHERE m.provider = ? AND m.message_uuid = ?
+        """, (args.provider, args.uuid))
+        result = cursor.fetchone()
+    elif args.provider == "claude":
+        cursor.execute("""
+            SELECT 'claude' AS provider, m.session_id, m.project_path,
+                   m.timestamp, m.summary
+            FROM messages m
+            WHERE m.message_uuid = ?
+        """, (args.uuid,))
+        result = cursor.fetchone()
 
     if not result:
         print(f"Message not found: {args.uuid}")
@@ -355,30 +420,30 @@ def cmd_resume(args):
     session_id = result['session_id']
     project_path = result['project_path']
 
-    # Convert project_path hash back to actual path
-    project_dir = project_path.replace('-', '/')
-    if not project_dir.startswith('/'):
-        project_dir = f"/{project_dir}"
-
-    print(f"cd {project_dir}")
-    print(f"{CLAUDE_CMD} --resume {session_id}")
+    print(f"cd {project_path}")
+    print(_resume_command(result["provider"], session_id))
 
 
 def cmd_mine_session(args):
-    """Resolve and mine a Claude Code session transcript.
+    """Resolve and mine a Claude Code or Codex session transcript.
 
     Delegates to `run_mine_session` so the package CLI and the Codex
     wrapper (`codex-skills/claude-session-miner/scripts/mine_claude_session.py`,
     which goes through `session_miner.main()`) share the exact same
     execution path. See issue #3.
     """
-    run_mine_session(args.session_id, args.transcript, json_output=args.json_output)
+    run_mine_session(
+        args.session_id,
+        args.transcript,
+        json_output=args.json_output,
+        provider=args.provider,
+    )
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='cc-conversation-search',
-        description='Find, resume, and mine Claude Code conversations'
+        description='Find, resume, and mine Claude Code and Codex conversations'
     )
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
@@ -390,6 +455,12 @@ def main():
     init_parser.add_argument('--no-extract', action='store_true', help='Skip smart extraction (store only raw content)')
     init_parser.add_argument('--force', action='store_true', help='Reinitialize existing database')
     init_parser.add_argument('--quiet', action='store_true', help='Minimal output')
+    init_parser.add_argument(
+        '--provider',
+        choices=('claude', 'codex', 'all'),
+        default='claude',
+        help='Transcript provider to index (default: claude)',
+    )
     init_parser.set_defaults(func=cmd_init)
 
     # index command
@@ -398,6 +469,12 @@ def main():
     index_parser.add_argument('--all', action='store_true', help='Index all conversations')
     index_parser.add_argument('--no-extract', action='store_true', help='Skip smart extraction')
     index_parser.add_argument('--quiet', action='store_true', help='Minimal output')
+    index_parser.add_argument(
+        '--provider',
+        choices=('claude', 'codex', 'all'),
+        default='claude',
+        help='Transcript provider to index (default: claude)',
+    )
     index_parser.set_defaults(func=cmd_index)
 
     # search command
@@ -412,6 +489,12 @@ def main():
     search_parser.add_argument('--content', action='store_true', help='Show full content')
     search_parser.add_argument('--json', action='store_true', help='Output as JSON')
     search_parser.add_argument('--no-index', action='store_true', help='Skip auto-indexing (faster but may be stale)')
+    search_parser.add_argument(
+        '--provider',
+        choices=('claude', 'codex', 'all'),
+        default='claude',
+        help='Transcript provider to search (default: claude)',
+    )
     search_parser.set_defaults(func=cmd_search)
 
     # context command
@@ -421,6 +504,12 @@ def main():
     context_parser.add_argument('--content', action='store_true', help='Show full content')
     context_parser.add_argument('--json', action='store_true', help='Output as JSON')
     context_parser.add_argument('--no-index', action='store_true', help='Skip auto-indexing (faster but may be stale)')
+    context_parser.add_argument(
+        '--provider',
+        choices=('claude', 'codex'),
+        default='claude',
+        help='Transcript provider (default: claude)',
+    )
     context_parser.set_defaults(func=cmd_context)
 
     # list command
@@ -432,27 +521,48 @@ def main():
     list_parser.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
     list_parser.add_argument('--json', action='store_true', help='Output as JSON')
     list_parser.add_argument('--no-index', action='store_true', help='Skip auto-indexing (faster but may be stale)')
+    list_parser.add_argument(
+        '--provider',
+        choices=('claude', 'codex', 'all'),
+        default='claude',
+        help='Transcript provider to list (default: claude)',
+    )
     list_parser.set_defaults(func=cmd_list)
 
     # tree command
     tree_parser = subparsers.add_parser('tree', help='Show conversation tree')
     tree_parser.add_argument('session_id', help='Session ID')
     tree_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    tree_parser.add_argument(
+        '--provider',
+        choices=('claude', 'codex'),
+        default='claude',
+        help='Transcript provider (default: claude)',
+    )
     tree_parser.set_defaults(func=cmd_tree)
 
     # resume command
     resume_parser = subparsers.add_parser('resume', help='Get session resumption commands')
     resume_parser.add_argument('uuid', help='Message UUID')
+    resume_parser.add_argument(
+        '--provider',
+        choices=('claude', 'codex'),
+        default='claude',
+        help='Transcript provider (default: claude)',
+    )
     resume_parser.set_defaults(func=cmd_resume)
 
     # mine-session command — flag surface lives in session_miner.add_mine_session_args
     # so this subparser and the Codex wrapper (which goes through
     # session_miner.main() / parse_args()) cannot drift.
-    mine_parser = subparsers.add_parser('mine-session', help='Resolve and mine a Claude Code session transcript')
+    mine_parser = subparsers.add_parser(
+        'mine-session',
+        help='Resolve and mine a Claude Code or Codex session transcript',
+    )
     add_mine_session_args(mine_parser)
     mine_parser.set_defaults(func=cmd_mine_session)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.command:
         parser.print_help()

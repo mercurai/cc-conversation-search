@@ -1,18 +1,20 @@
 ---
 name: conversation-search
-description: Find and resume Claude Code conversations by searching topics or filtering by date. Returns session IDs and project paths for easy resumption via 'claude --resume'. Use when user asks "find that conversation about X", "what did we discuss", "what did we work on yesterday", "summarize today's work", "show this week's conversations", "recent projects we accomplished", or wants to locate past work by topic, date, or time period (yesterday, today, last week, specific dates).
+description: Find and resume Claude Code and Codex conversations by provider, topic, project, or date. Returns provider-qualified session IDs and exact resume commands.
 allowed-tools: Bash, TodoWrite
 ---
 
 # Conversation Search
 
-Find past conversations in your Claude Code history and get the commands to resume them.
+Find past Claude Code or Codex conversations and get the provider-specific
+commands to resume them. Claude is the default for backward compatibility.
 
 ## See also
 
 For **transcript mining** (resolving a single session and parsing it into structured
 facts — tool calls, files touched, errors, recommendations), use the
-`claude-session-miner` skill or run `cc-conversation-search mine-session <id> --json`
+`session-miner` skill or run
+`cc-conversation-search mine-session <id> --provider <provider> --json`
 directly. This skill covers search, listing, and resumption only.
 
 ## MANDATORY FIRST STEP - CREATE TODO CHECKLIST
@@ -20,7 +22,8 @@ directly. This skill covers search, listing, and resumption only.
 **Before doing ANYTHING else, you MUST use the TodoWrite tool to create this exact checklist:**
 
 ```
-- Ensure cc-conversation-search tool is installed and upgraded
+- Ensure the local cc-conversation-search fork is installed
+- Select provider (claude, codex, or all)
 - Classify query type (temporal/topic/hybrid)
 - Execute Level 1: focused search with cc-conversation-search
 - Execute Level 2: broader search if Level 1 fails
@@ -40,23 +43,14 @@ Mark each todo as `in_progress` when starting it, `completed` when done.
 
 The skill requires the `cc-conversation-search` CLI tool (v0.4.0+ minimum).
 
-**First todo: Ensure tool is installed and upgraded**
+**First todo: Ensure the local fork is installed**
 
 ```bash
-# Check if installed and upgrade
 if command -v cc-conversation-search &> /dev/null; then
-    uv tool upgrade cc-conversation-search 2>/dev/null || pip install --upgrade cc-conversation-search
-    echo "Upgraded to: $(cc-conversation-search --version)"
+    cc-conversation-search --version
 else
-    # Install if needed
-    if command -v uv &> /dev/null; then
-        uv tool install cc-conversation-search
-    else
-        pip install --user cc-conversation-search
-        export PATH="$HOME/.local/bin:$PATH"
-    fi
-    # Initialize database
-    cc-conversation-search init --days 7
+    bash install.sh
+    cc-conversation-search init --days 7 --provider claude
 fi
 ```
 
@@ -64,16 +58,25 @@ fi
 ```
 The conversation-search plugin requires the cc-conversation-search CLI tool.
 
-Install it manually:
-  uv tool install cc-conversation-search  (recommended)
-  OR
-  pip install --user cc-conversation-search
+Install the Mercurai fork from its checkout:
+  bash install.sh
 
 Then initialize:
-  cc-conversation-search init
+  cc-conversation-search init --provider claude
 ```
 
 **Do not proceed with search** until installation is confirmed.
+Do not run `uv tool upgrade cc-conversation-search`; it may replace this fork
+with a provider-incomplete PyPI build.
+
+## Provider selection
+
+- `--provider claude`: Claude Code only; default and backward-compatible.
+- `--provider codex`: Codex only.
+- `--provider all`: search or list both providers.
+
+Use a single provider for `context`, `tree`, and `resume`, because message and
+session IDs can overlap across providers.
 
 ## Query Type Classification
 
@@ -115,12 +118,12 @@ Based on query classification:
 
 **For Topic or Hybrid queries:**
 ```bash
-cc-conversation-search search "search terms" --days 14 --json
+cc-conversation-search search "search terms" --provider <claude|codex|all> --days 14 --json
 ```
 
 **For Temporal queries:**
 ```bash
-cc-conversation-search list --date yesterday --json  # or --days N, --since, --until
+cc-conversation-search list --provider <claude|codex|all> --date yesterday --json
 ```
 
 **Parse the JSON output.** If you find relevant matches → skip to Level 4 (present results).
@@ -132,7 +135,8 @@ cc-conversation-search list --date yesterday --json  # or --days N, --since, --u
 **Only if Level 1 found nothing useful.**
 
 For topic/hybrid queries:
-- Remove time constraints: `cc-conversation-search search "terms" --json`
+- Remove time constraints:
+  `cc-conversation-search search "terms" --provider <provider> --json`
 - Try alternative keywords: "auth" vs "authentication"
 - Try broader terms: "database" vs "postgres"
 
@@ -145,9 +149,11 @@ For temporal queries:
 
 **Only if Levels 1 and 2 both failed.**
 
-1. List conversations: `cc-conversation-search list --days 30 --json`
+1. List conversations:
+   `cc-conversation-search list --provider <provider> --days 30 --json`
 2. Review conversation summaries in JSON
-3. For promising sessions: `cc-conversation-search tree <SESSION_ID> --json`
+3. For promising sessions:
+   `cc-conversation-search tree <SESSION_ID> --provider <claude|codex> --json`
 4. Read message summaries to locate content
 
 ### Level 4: Present Results
@@ -167,6 +173,8 @@ For found conversations:
 ```bash
 cd /home/user/projects/myproject
 claude --resume abc-123-session-id
+# or
+codex resume abc-123-session-id
 ```
 ```
 
@@ -222,10 +230,11 @@ cc-conversation-search tree <SESSION_ID> --json
 
 **Always use `--json` for structured output.**
 
-**Resolution rule (shared with the `claude-session-miner` skill):** Treat any
+**Resolution rule (shared with the `session-miner` skill):** Treat any
 `cc-conversation-search tree <SESSION_ID> --json` response containing an
-`"error"` field as unresolved, even when the command exits `0`. Do not infer
-session existence from incidental mentions in Codex-side transcripts.
+`"error"` field as unresolved, even when the command exits `0`. For Codex,
+validate the candidate file's `session_meta`; a filename match alone is not
+resolution.
 
 ## Examples
 
