@@ -364,14 +364,13 @@ raise SystemExit(0)
 
 PLUGIN_SPEC="${PLUGIN_NAME}@${MARKETPLACE_NAME}"
 
-if command -v codex >/dev/null 2>&1; then
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    say "[DRY-RUN] would ensure marketplace '${MARKETPLACE_NAME}' is configured from ${MARKETPLACE_ROOT}"
-    say "[DRY-RUN] would run: codex plugin add ${PLUGIN_SPEC} --json"
-    if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
-      say "[DRY-RUN] would verify Codex JSON state is enabled with source ${PLUGIN_SOURCE_PATH}"
-    fi
-  else
+if [[ "${DRY_RUN}" == "1" ]]; then
+  say "[DRY-RUN] would ensure marketplace '${MARKETPLACE_NAME}' is configured from ${MARKETPLACE_ROOT}"
+  say "[DRY-RUN] would run: codex plugin add ${PLUGIN_SPEC} --json"
+  if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
+    say "[DRY-RUN] would verify Codex JSON state is enabled with source ${PLUGIN_SOURCE_PATH}"
+  fi
+elif command -v codex >/dev/null 2>&1; then
     expected_marketplace_root=""
     if [[ "${MANAGED_CHECKOUT}" == "1" ]]; then
       expected_marketplace_root="$(canonical_path "${MARKETPLACE_ROOT}")"
@@ -405,7 +404,6 @@ if command -v codex >/dev/null 2>&1; then
       say "ERROR: Codex plugin was not reported as installed and enabled from the expected source."
       exit 1
     fi
-  fi
 else
   say "Codex CLI not found; marketplace entry was written but activation was skipped."
 fi
