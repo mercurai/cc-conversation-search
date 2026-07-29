@@ -1,0 +1,8 @@
+{"type":"session_meta","timestamp":"2026-01-02T03:04:05Z","payload":{"id":"codex-session-001","session_id":"codex-session-001","cwd":"D:\\projects\\provider-parity-fixture","originator":"codex-tui","model_provider":"openai"}}
+{"type":"event_msg","timestamp":"2026-01-02T03:04:06Z","payload":{"type":"user_message","message":"Investigate the sanitized provider fixture.","text_elements":[]}}
+{"type":"response_item","timestamp":"2026-01-02T03:04:07Z","payload":{"type":"message","id":"assistant-message-001","role":"assistant","content":[{"type":"output_text","text":"Inspecting the provider boundary."}]}}
+{"type":"response_item","timestamp":"2026-01-02T03:04:08Z","payload":{"type":"function_call","id":"tool-call-001","call_id":"call-001","name":"exec_command","arguments":"{\"cmd\":\"git status\"}"}}
+{"type":"response_item","timestamp":"2026-01-02T03:04:09Z","payload":{"type":"function_call_output","id":"tool-output-001","call_id":"call-001","output":"{\"exit_code\":1,\"output\":\"sanitized command failure\"}"}}
+{"type":"event_msg","timestamp":"2026-01-02T03:04:10Z","payload":{"type":"sub_agent_activity","kind":"started","agent_path":"provider-fixture-agent","event_id":"event-001"}}
+{"type":"response_item","timestamp":"2026-01-02T03:04:11Z","payload":{"type":"reasoning","id":"reasoning-001","encrypted_content":"fixture-encrypted-content","summary":[]}}
+{"type":"event_msg","timestamp":"2026-01-02T03:04:12Z","payload":{"type":"task_complete","turn_id":"turn-001","last_agent_message":"Sanitized completion."}}

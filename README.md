@@ -1,10 +1,14 @@
 # Conversation Search
 
-Find, resume, and mine past Claude Code conversations using smart hybrid extraction, JIT indexing, and transcript fallback mining. Get session IDs and project paths to easily jump back into previous work.
+Find, resume, and mine Claude Code and Codex conversations using
+provider-qualified indexing, structural transcript validation, bounded
+redaction, and provider-specific resume commands. Claude remains the default
+provider for backward compatibility.
 
 ## Features
 
-- **Session Resumption**: Get exact commands to resume past conversations
+- **Provider Adapters**: Normalize Claude Code and Codex JSONL without exposing encrypted reasoning
+- **Session Resumption**: Emit `claude --resume` or `codex resume` as appropriate
 - **Unified CLI**: Single `cc-conversation-search` command with intuitive subcommands
 - **Calendar Date Filtering**: Intuitive `--date yesterday`, `--since`, `--until` parameters
 - **Smart Extraction**: Hybrid indexing (full user content + smart assistant extraction)
@@ -13,10 +17,12 @@ Find, resume, and mine past Claude Code conversations using smart hybrid extract
 - **Meta-Conversation Filtering**: Automatically excludes search tool usage from results
 - **Progressive Exploration**: Simple search → broader search → manual exploration
 - **Conversation Context**: Expand context incrementally around any message
-- **Claude Code Skill**: Integrated Skill that outputs session resumption commands
-- **Codex Plugin Adapter**: Includes a Codex plugin with a session-mining skill
+- **Explicit Skills on Both Surfaces**: `claude-session-miner`,
+  `codex-session-miner`, and generic `session-miner`
+- **Codex Plugin Activation**: `install.sh` registers the marketplace and uses
+  `codex plugin add` to leave the plugin installed and enabled
 - **Transcript Mining**: Mine a session by ID or transcript path with autoresearch correlation
-- **Multi-Project Support**: Works across all your Claude Code projects
+- **Multi-Project Support**: Works across Claude Code and Codex projects
 
 ## Quick Start
 
@@ -33,8 +39,9 @@ Install the complete plugin (skill + CLI tool instructions) directly in Claude C
 ```
 
 Then follow the installation instructions shown by Claude to:
-1. Install the CLI tool: `uv tool install cc-conversation-search`
-2. Initialize the database: `cc-conversation-search init`
+1. Install this repository's fork: `bash install.sh`
+2. Initialize one or both providers:
+   `cc-conversation-search init --provider all`
 
 ### Installation via Codex Plugin
 
@@ -49,24 +56,22 @@ This will:
 
 1. install the Mercurai fork into the `uv` tool environment
 2. register the Codex plugin in `~/.agents/plugins/marketplace.json`
-3. keep the canonical local plugin path at `~/plugins/cc-conversation-search`
+3. run `codex plugin add cc-conversation-search@mercurai-local-plugins`
+4. keep the canonical local plugin path at `~/plugins/cc-conversation-search`
 
 ### Manual Installation
 
 #### 1. Install CLI Tool
 
 ```bash
-# Using uv (recommended)
-uv tool install cc-conversation-search
-
-# Or using pip
-pip install cc-conversation-search
+# From this repository checkout
+bash install.sh
 ```
 
 #### 2. Initialize Database
 
 ```bash
-cc-conversation-search init
+cc-conversation-search init --provider all
 ```
 
 This creates the database and indexes your last 7 days of conversations.
@@ -84,6 +89,10 @@ cp skills/conversation-search/* ~/.claude/skills/conversation-search/
 # Search for conversations (shows session ID and resume commands)
 cc-conversation-search search "authentication bug"
 
+# Search only Codex, or both providers
+cc-conversation-search search "authentication bug" --provider codex
+cc-conversation-search search "authentication bug" --provider all
+
 # Search with calendar date filters
 cc-conversation-search search "react hooks" --date yesterday
 cc-conversation-search search "auth" --since 2025-11-10 --until 2025-11-13
@@ -97,9 +106,7 @@ cc-conversation-search search "query" --days 30
 
 # Get resume commands for a specific message
 cc-conversation-search resume <MESSAGE_UUID>
-
-# Use with uvx (no install needed)
-uvx cc-conversation-search search "query"
+cc-conversation-search resume <MESSAGE_UUID> --provider codex
 ```
 
 ### Using with Claude Code Skill
@@ -120,7 +127,8 @@ Once installed, ask Claude:
 - "Find yesterday's authentication work"
 - "Show recent Redis discussions"
 
-**Auto-Installation**: If the CLI tool isn't installed, the skill will automatically attempt to install it via `uv` or `pip`, then initialize the database. In most cases, everything "just works" after installing the plugin!
+If the CLI is missing, the skills direct the operator to this repository's
+`install.sh`; they do not auto-upgrade from PyPI.
 
 Claude will show you the session ID, project path, and exact commands to resume the conversation.
 
@@ -151,6 +159,30 @@ bash install.sh --dry-run                       # print actions, do not execute
 INSTALL_FORCE_STALE=1 bash install.sh --dry-run # also exercise the recovery branch
 ```
 
+### Pinned managed-checkout installation
+
+Configuration managers that already created and verified a pinned checkout
+must use the explicit in-place mode:
+
+```bash
+bash /path/to/pinned/checkout/install.sh --managed-checkout
+```
+
+This mode preserves the caller's pin:
+
+- installs the CLI from the exact checkout that contains `install.sh`;
+- never clones, fetches, pulls, redirects, or re-executes another checkout;
+- refuses a dirty managed checkout;
+- writes the exact absolute checkout path into the local marketplace entry;
+- installs the explicit Claude and Codex miner skills only into safe,
+  plugin-owned directories; and
+- activates the Codex plugin and verifies through JSON state that it is enabled
+  from the expected checkout.
+
+Use `--managed-checkout --dry-run` to inspect the complete plan without writes.
+The default mode remains the canonical `~/plugins/cc-conversation-search`
+workflow for interactive users.
+
 ### Stale-launcher recovery
 
 The most common failure mode is a `cc-conversation-search` launcher left over from a removed `uv tool` venv: the binary exists on PATH but `cc-conversation-search --version` fails or `uv tool list` does not list it. `install.sh`'s pre-flight detects this and runs the recovery sequence below automatically. To repair manually:
@@ -180,13 +212,13 @@ A foreign installation (e.g. `pip --user`, brew) shadowing the uv launcher is a 
 ### `cc-conversation-search init`
 Initialize database and perform initial indexing
 ```bash
-cc-conversation-search init [--days 7] [--no-extract] [--force]
+cc-conversation-search init [--provider claude|codex|all] [--days 7] [--no-extract] [--force]
 ```
 
 ### `cc-conversation-search index`
 JIT index conversations (instant, no AI calls)
 ```bash
-cc-conversation-search index [--days N] [--all] [--no-extract]
+cc-conversation-search index [--provider claude|codex|all] [--days N] [--all] [--no-extract]
 ```
 
 **IMPORTANT**: The skill always runs `index` before `search` for fresh data.
@@ -195,7 +227,7 @@ cc-conversation-search index [--days N] [--all] [--no-extract]
 Search conversations with flexible date filtering
 ```bash
 # Traditional relative time
-cc-conversation-search search "query" [--days N] [--project PATH] [--content] [--json]
+cc-conversation-search search "query" [--provider claude|codex|all] [--days N] [--project PATH] [--content] [--json]
 
 # Calendar date filtering (v0.4.8+)
 cc-conversation-search search "query" --date yesterday [--json]
@@ -209,14 +241,14 @@ cc-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 [--j
 ### `cc-conversation-search context`
 Get context around a specific message
 ```bash
-cc-conversation-search context MESSAGE_UUID [--depth 5] [--content] [--json]
+cc-conversation-search context MESSAGE_UUID [--provider claude|codex] [--depth 5] [--content] [--json]
 ```
 
 ### `cc-conversation-search list`
 List recent conversations with calendar date support
 ```bash
 # Traditional relative time
-cc-conversation-search list [--days 7] [--limit 20] [--json]
+cc-conversation-search list [--provider claude|codex|all] [--days 7] [--limit 20] [--json]
 
 # Calendar date filtering (v0.4.8+)
 cc-conversation-search list --date yesterday [--json]
@@ -226,7 +258,7 @@ cc-conversation-search list --since 2025-11-10 --until today [--json]
 ### `cc-conversation-search tree`
 View conversation tree structure
 ```bash
-cc-conversation-search tree SESSION_ID [--json]
+cc-conversation-search tree SESSION_ID [--provider claude|codex] [--json]
 ```
 
 ### `cc-conversation-search mine-session`
@@ -236,10 +268,10 @@ session analysis.
 
 ```bash
 # Human-readable text report (default)
-cc-conversation-search mine-session SESSION_ID [--transcript PATH]
+cc-conversation-search mine-session SESSION_ID [--provider claude|codex|auto] [--transcript PATH]
 
 # Structured machine-readable output (schema_version: 1)
-cc-conversation-search mine-session SESSION_ID [--transcript PATH] --json
+cc-conversation-search mine-session SESSION_ID [--provider claude|codex|auto] [--transcript PATH] --json
 ```
 
 The `--json` output is a single object with stable top-level keys:
@@ -248,7 +280,8 @@ The `--json` output is a single object with stable top-level keys:
 |---|---|
 | `schema_version` | Integer. `1` today. Bumped on breaking changes. |
 | `session_id` | The session ID that was looked up. |
-| `resolution` | Stage-based resolution result (see `resolve_session()` in `core/session_miner.py`). Stages run in order `tree → explicit → claude_root`. Codex filename matches are recorded as evidence-only and never set `resolved=true`. |
+| `requested_provider` / `resolved_provider` | Provider requested by the caller and provider structurally validated from the resolved transcript. |
+| `resolution` | Stage-based result. Claude uses `tree → explicit → claude_root`; Codex uses explicit metadata validation or bounded `~/.codex/sessions` discovery. Filename matches alone never set `resolved=true`. |
 | `summary` | Parsed transcript summary (record/tool/attachment counts, files touched, shell commands, errors, time range). `null` when the transcript could not be resolved. |
 | `db_signals` | Per-DB lookup result for known autoresearch / research databases. |
 | `recommendations` | Stable list of operator-facing recommendations. |
@@ -260,6 +293,8 @@ produced by both the package CLI (`cc-conversation-search mine-session`) and
 the Codex wrapper script
 (`codex-skills/claude-session-miner/scripts/mine_claude_session.py`); both go
 through `conversation_search.run_mine_session()`.
+Repeated evidence arrays are capped at 200 items and report per-field
+truncation in `summary.evidence_truncated`.
 
 ## Architecture
 
@@ -270,6 +305,9 @@ through `conversation_search.run_mine_session()`.
 │       └── {session}.jsonl
 └── skills/
     └── conversation-search/  # Optional Claude skill
+
+~/.codex/
+└── sessions/           # Codex rollout transcripts (JSONL)
 
 ~/.agents/
 └── plugins/
@@ -283,14 +321,14 @@ through `conversation_search.run_mine_session()`.
 
 ### Database Schema
 
-- **messages**: Individual messages with summaries, tree structure (parent_uuid), timestamps
-- **conversations**: Session metadata with conversation summaries
-- **message_summaries_fts**: FTS5 full-text search index
+- **messages**: Provider-qualified messages with tree structure and timestamps
+- **conversations**: Provider-qualified session metadata
+- **message_content_fts**: FTS5 full-text search index
 - **index_queue**: Processing queue for batch operations
 
 ## How It Works
 
-1. **Indexer**: Scans `~/.claude/projects/` for JSONL conversation files, parses tree structure
+1. **Indexer**: Scans the selected roots: `~/.claude/projects/` and/or `~/.codex/sessions/`
 2. **Smart Extraction**: Hybrid approach - full user content + first 500/last 200 chars for assistant
 3. **Meta-Conversation Filtering**: Automatically detects and excludes conversations where Claude used the search tool (prevents search results pollution)
 4. **Search**: FTS5 full-text search over extracted content with conversation tree traversal
@@ -428,15 +466,22 @@ conversation-search/
 │       ├── cli.py              # Unified CLI
 │       ├── core/
 │       │   ├── indexer.py      # Conversation indexing + meta-filtering
+│       │   ├── providers/      # Claude Code and Codex transcript adapters
 │       │   ├── search.py       # Search functionality + date filtering
+│       │   ├── session_miner.py # Provider-aware resolution and mining
 │       │   ├── date_utils.py   # Calendar date parsing (v0.4.8+)
 │       │   └── summarization.py # Smart hybrid extraction
 │       └── data/
 │           └── schema.sql      # Database schema
 ├── skills/
-│   └── conversation-search/
-│       ├── SKILL.md           # Claude Code Skill with query classification
-│       └── REFERENCE.md       # Complete command reference
+│   ├── conversation-search/
+│   ├── session-miner/
+│   ├── claude-session-miner/
+│   └── codex-session-miner/
+├── codex-skills/
+│   ├── session-miner/
+│   ├── claude-session-miner/
+│   └── codex-session-miner/
 ├── tests/
 │   ├── test_date_utils.py     # Date parsing tests
 │   ├── test_date_filtering.py # Date filter integration tests
@@ -449,12 +494,12 @@ conversation-search/
 
 **"Database not found" error:**
 ```bash
-cc-conversation-search init
+cc-conversation-search init --provider all
 ```
 
 **"No conversations found":**
-- Verify `~/.claude/projects/` exists and contains JSONL files
-- Use Claude Code to create some conversations first
+- Verify `~/.claude/projects/` or `~/.codex/sessions/` contains JSONL files
+- Select the intended provider explicitly with `--provider`
 
 **Want to skip extraction and use raw content only:**
 ```bash
@@ -470,8 +515,7 @@ cc-conversation-search init --no-extract
 
 **Import errors:**
 ```bash
-uv tool uninstall cc-conversation-search
-uv tool install cc-conversation-search
+bash install.sh
 ```
 
 ## Contributing

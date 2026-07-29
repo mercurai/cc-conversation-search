@@ -6,24 +6,24 @@ Thank you for installing the **conversation-search** plugin!
 
 The skill requires the `conversation-search` CLI tool.
 
-**Note**: The package name is `cc-conversation-search` but the command is `conversation-search`.
+The package and command are both named `cc-conversation-search`.
 
 ### Recommended: Using uv
 ```bash
-uv tool install cc-conversation-search
+bash install.sh
 ```
 
 ### Alternative: Using pip
 ```bash
-pip install cc-conversation-search
+uv tool install --force .
 ```
 
 ## Step 2: Initialize the Database
 
-Create the search index for your conversation history:
+Create the search index for Claude Code, Codex, or both:
 
 ```bash
-cc-conversation-search init
+cc-conversation-search init --provider all
 ```
 
 This will:
@@ -56,8 +56,8 @@ Claude will use a progressive search strategy to find specific message UUIDs you
 - Try: `which cc-conversation-search`
 
 **No conversations found:**
-- Verify `~/.claude/projects/` exists and contains .jsonl files
-- Try: `cc-conversation-search list --days 30`
+- Verify `~/.claude/projects/` or `~/.codex/sessions/` contains JSONL files
+- Try: `cc-conversation-search list --provider all --days 30`
 
 **Stale launcher (CLI on PATH but broken):**
 
@@ -88,6 +88,19 @@ If you do not yet have a repo checkout, clone it first:
 git clone https://github.com/mercurai/cc-conversation-search ~/plugins/cc-conversation-search
 bash ~/plugins/cc-conversation-search/install.sh
 ```
+
+**Pinned/managed checkout:**
+
+When another configuration manager already checked out an exact commit, use:
+
+```bash
+bash /path/to/pinned/checkout/install.sh --managed-checkout
+```
+
+This installs in place without clone/fetch/pull or redirecting to
+`~/plugins/cc-conversation-search`. It records the exact checkout as the Codex
+plugin source, safely packages both provider skills, and verifies the enabled
+plugin through `codex plugin list --json`.
 
 Do not run `uv tool upgrade cc-conversation-search` — that re-resolves from
 PyPI and would replace this mercurai build with the upstream package.

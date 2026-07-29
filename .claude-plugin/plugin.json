@@ -1,13 +1,16 @@
 {
   "name": "conversation-search",
   "version": "0.6.0",
-  "description": "Find and resume Claude Code conversations using semantic search. Returns session IDs and project paths for easy resumption via 'claude --resume'.",
+  "description": "Find, resume, and mine Claude Code and Codex conversations with provider-aware search, transcript validation, and redaction.",
   "author": {
     "name": "mercurai",
     "url": "https://github.com/mercurai"
   },
   "homepage": "https://github.com/mercurai/cc-conversation-search",
   "skills": [
-    "./skills/conversation-search"
+    "./skills/conversation-search",
+    "./skills/session-miner",
+    "./skills/claude-session-miner",
+    "./skills/codex-session-miner"
   ]
 }

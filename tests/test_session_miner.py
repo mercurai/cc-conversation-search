@@ -16,9 +16,20 @@ from conversation_search.core.session_miner import (
     mine_session,
     normalize_exit_code,
     normalize_project_path,
+    parse_transcript,
     resolve_session,
     run_mine_session,
 )
+
+
+def _load_rich_fixture_path() -> Path:
+    """Return the on-disk path to the canonical rich-session fixture.
+
+    The fixture is committed at tests/fixtures/rich_session.jsonl alongside
+    this test module. Tests that need the realistic record-type mix load it
+    via this helper rather than constructing an inline transcript.
+    """
+    return Path(__file__).parent / "fixtures" / "rich_session.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +308,7 @@ def test_resolve_session_schema_is_stable(tmp_path, monkeypatch):
     expected_keys = {
         "session_id", "resolved", "resolved_path", "resolution_stage",
         "stages", "tree_metadata", "project_path", "project_path_raw",
+        "requested_provider", "resolved_provider", "transcript_format",
     }
     assert set(out.keys()) == expected_keys
     assert set(out["stages"].keys()) == {
@@ -376,6 +388,7 @@ def test_mine_session_unresolved_returns_full_schema(tmp_path, monkeypatch):
     assert set(out.keys()) == {
         "schema_version", "session_id", "resolution",
         "summary", "db_signals", "recommendations",
+        "requested_provider", "resolved_provider", "transcript_format",
     }
     assert out["resolution"]["resolved"] is False
     assert out["summary"] is None
@@ -488,3 +501,176 @@ def test_run_mine_session_json_mode_writes_parseable_json(tmp_path, monkeypatch)
     assert parsed["session_id"] == "abc"
     assert parsed["resolution"]["resolved"] is False
     assert parsed["summary"] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (issue #5) — mixed-environment fixtures and regression coverage
+#
+# Each test below targets one of the regression risks documented in the Phase
+# 4 plan (R1–R8). The rich fixture at tests/fixtures/rich_session.jsonl is
+# the canonical "what real transcripts look like" reference.
+# ---------------------------------------------------------------------------
+
+def test_rich_fixture_lines_are_all_valid_json():
+    """Sanity: the committed fixture must remain parseable line by line."""
+    path = _load_rich_fixture_path()
+    assert path.is_file(), f"rich fixture missing at {path}"
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                pytest.fail(f"rich fixture line {line_no} is not valid JSON: {exc}")
+
+
+def test_parse_transcript_extracts_multiple_shell_commands_from_rich_fixture():
+    """R5: shell-command deduplication preserves first-occurrence order and
+    drops repeats. Rich fixture intentionally repeats `pytest -q`."""
+    summary = parse_transcript(_load_rich_fixture_path())
+    assert summary["shell_commands"] == ["pytest -q", "git status"]
+    # Dedup is exact: "pytest -q" appears once even though the fixture
+    # has two assistant Bash records with the same command.
+    assert summary["shell_commands"].count("pytest -q") == 1
+
+
+def test_parse_transcript_extracts_files_touched_across_tools_from_rich_fixture():
+    """R6: files_touched must accumulate counts across every tool that emits
+    a file_path (Read, Edit, Write — not just Read)."""
+    summary = parse_transcript(_load_rich_fixture_path())
+    assert summary["files_touched"]["src/foo.py"] == 3  # Read x2 + Edit x1
+    assert summary["files_touched"]["src/bar.py"] == 1  # Write x1
+
+
+def test_parse_transcript_extracts_hook_attachment_errors_from_rich_fixture():
+    """R3: hook attachment error records (hook_non_blocking_error, tool_error)
+    must surface in summary.errors with the documented field shape;
+    hook_success must NOT appear."""
+    summary = parse_transcript(_load_rich_fixture_path())
+
+    types = [e["type"] for e in summary["errors"]]
+    assert "hook_non_blocking_error" in types
+    assert "tool_error" in types
+    assert "hook_success" not in types
+
+    by_type = {e["type"]: e for e in summary["errors"]}
+    hook_err = by_type["hook_non_blocking_error"]
+    assert hook_err["hook"] == "SessionStart:startup"
+    assert hook_err["exit_code"] == 126
+    assert "cannot execute binary file" in hook_err["stderr"]
+
+    tool_err = by_type["tool_error"]
+    assert tool_err["exit_code"] == 1
+    assert tool_err["command"] == "curl http://127.0.0.1:9999"
+    assert "connection refused" in tool_err["stderr"]
+
+
+def test_parse_transcript_extracts_tool_result_is_error_from_rich_fixture():
+    """R4: a user-message content list with `tool_result` `is_error: true`
+    must be captured as an error of type 'tool_result_error'."""
+    summary = parse_transcript(_load_rich_fixture_path())
+    matches = [e for e in summary["errors"] if e["type"] == "tool_result_error"]
+    assert len(matches) == 1
+    assert matches[0]["stderr"] == "file not found: src/missing.py"
+    assert matches[0]["hook"] is None
+    assert matches[0]["command"] is None
+
+
+def test_parse_transcript_record_counts_match_rich_fixture():
+    """R7: record_counts must accurately tally the fixture's known shape.
+
+    Fixture composition: 1 summary, 1 queue-operation, 2 user, 8 assistant,
+    3 attachment = 15 records total.
+    """
+    summary = parse_transcript(_load_rich_fixture_path())
+    counts = summary["record_counts"]
+    assert counts["summary"] == 1
+    assert counts["queue-operation"] == 1
+    assert counts["user"] == 2
+    assert counts["assistant"] == 8
+    assert counts["attachment"] == 3
+    assert summary["records"] == 15
+    assert summary["user_turns"] == 2
+    assert summary["assistant_turns"] == 8
+
+
+def test_mine_session_against_rich_fixture_round_trips_json(tmp_path, monkeypatch):
+    """R1, R8 (and rolls in explicit-Windows-path-input + project-path
+    semantics at the mine_session level): the full pipeline against the rich
+    fixture must produce a JSON-clean payload that round-trips through
+    json.dumps with no default= and reflects the fixture's known shape."""
+    fixture = _load_rich_fixture_path()
+    _stub_tree(monkeypatch, {"status": "missing", "checked": [], "error": "stub"})
+    # Isolate Path.home() so resolve_session's default claude_root and
+    # mine_session's db_paths don't accidentally find anything real.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    # Pass with forward-slash separators — the explicit-Windows-path-input
+    # shape that issue #5 requires coverage for.
+    out = mine_session("abc-id", transcript=str(fixture).replace("\\", "/"))
+
+    # Round-trip through json.dumps with NO default= safety net. Any leak
+    # of Path/datetime/Counter would raise TypeError here.
+    serialized = json.dumps(out)
+    reparsed = json.loads(serialized)
+
+    # Resolution shape: explicit-stage win
+    assert reparsed["schema_version"] == 1
+    assert reparsed["resolution"]["resolved"] is True
+    assert reparsed["resolution"]["resolution_stage"] == "explicit"
+    assert reparsed["resolution"]["resolved_path"] is not None
+
+    # Project path semantics: cwd recovered from the fixture's first
+    # cwd-bearing record. The rich fixture's user record has
+    # cwd="D:\\projects\\demo".
+    assert reparsed["resolution"]["project_path"] == "D:\\projects\\demo"
+    assert "//" not in reparsed["resolution"]["project_path"]
+
+    # Summary shape: matches the fixture
+    summary = reparsed["summary"]
+    assert summary is not None
+    assert summary["records"] == 15
+    assert summary["shell_commands"] == ["pytest -q", "git status"]
+    # tool_counts is the JSON-clean [{name, count}, ...] form
+    by_tool = {item["name"]: item["count"] for item in summary["tool_counts"]}
+    assert by_tool["Bash"] == 3
+    assert by_tool["Read"] == 2
+    assert by_tool["Edit"] == 1
+    assert by_tool["Write"] == 1
+    assert by_tool["Agent"] == 1
+
+    # Errors: three distinct error sources surface
+    err_types = {e["type"] for e in summary["errors"]}
+    assert err_types == {"hook_non_blocking_error", "tool_error", "tool_result_error"}
+
+
+def test_mine_session_with_only_codex_match_remains_unresolved(tmp_path, monkeypatch):
+    """R2 at the mine_session pipeline level: if the only on-disk evidence
+    of the session is a Codex-side filename match — no Claude transcript,
+    no resolved tree result — `mine_session` must return resolved=False and
+    record the Codex hit as evidence-only."""
+    # Plant a Codex-side file with the session id in its name.
+    codex_dir = tmp_path / ".codex" / "sessions"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "incidental-mention-of-feed-me.jsonl").write_text("{}\n", encoding="utf-8")
+
+    _stub_tree(monkeypatch, {"status": "missing", "checked": [], "error": "stub"})
+    # Redirect Path.home() so resolve_session walks the planted tmp_path
+    # rather than the real ~/.codex.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    out = mine_session("feed-me")
+
+    assert out["resolution"]["resolved"] is False
+    assert out["resolution"]["resolution_stage"] is None
+    assert out["resolution"]["resolved_path"] is None
+    assert any(
+        "incidental-mention-of-feed-me" in p
+        for p in out["resolution"]["stages"]["codex_filename_matches"]
+    )
+    # No transcript was resolved, so no summary
+    assert out["summary"] is None

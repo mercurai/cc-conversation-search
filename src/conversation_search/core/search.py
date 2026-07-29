@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Conversation Search Search Tools
-Provides search and retrieval tools for Claude to query conversation history
+Conversation Search Tools
+Provides provider-aware search and retrieval for conversation history
 """
 
 import json
@@ -58,6 +58,11 @@ class ConversationSearch:
 
         self.conn.row_factory = sqlite3.Row
         self._fts_rebuilt = False
+        message_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        self._has_provider = "provider" in message_columns
 
     def search_conversations(
         self,
@@ -68,7 +73,8 @@ class ConversationSearch:
         date: Optional[str] = None,
         limit: int = 20,
         project_path: Optional[str] = None,
-        snippet_tokens: int = 128
+        snippet_tokens: int = 128,
+        provider: Optional[str] = "claude",
     ) -> List[Dict]:
         """
         Search conversations using full-text search on complete content
@@ -86,17 +92,26 @@ class ConversationSearch:
         Returns:
             List of matching messages with context snippets
         """
+        if not self._has_provider and provider not in (None, "claude"):
+            return []
         # Validate mutually exclusive date filters
         if days_back and (since or until or date):
             raise ValueError("Cannot use --days with --since/--until/--date")
         cursor = self.conn.cursor()
+        provider_select = "m.provider" if self._has_provider else "'claude' AS provider"
+        conversation_join = (
+            "m.provider = c.provider AND m.session_id = c.session_id"
+            if self._has_provider
+            else "m.session_id = c.session_id"
+        )
 
         # Handle empty query (match all)
         if not query or not query.strip():
             # No FTS search, just filter by dates/project
-            sql = """
+            sql = f"""
                 SELECT
                     m.message_uuid,
+                    {provider_select},
                     m.session_id,
                     m.parent_uuid,
                     m.timestamp,
@@ -108,7 +123,8 @@ class ConversationSearch:
                     c.conversation_summary,
                     c.conversation_file
                 FROM messages m
-                JOIN conversations c ON m.session_id = c.session_id
+                JOIN conversations c
+                  ON {conversation_join}
                 WHERE m.is_meta_conversation = FALSE
             """
             params = []
@@ -122,9 +138,10 @@ class ConversationSearch:
                 else:
                     fts_query = ' '.join(f'{term}*' for term in terms)
 
-            sql = """
+            sql = f"""
                 SELECT
                     m.message_uuid,
+                    {provider_select},
                     m.session_id,
                     m.parent_uuid,
                     m.timestamp,
@@ -137,11 +154,16 @@ class ConversationSearch:
                     c.conversation_file
                 FROM messages m
                 JOIN message_content_fts ON m.rowid = message_content_fts.rowid
-                JOIN conversations c ON m.session_id = c.session_id
+                JOIN conversations c
+                  ON {conversation_join}
                 WHERE message_content_fts.full_content MATCH ?
                   AND m.is_meta_conversation = FALSE
             """
             params = [snippet_tokens, fts_query]
+
+        if provider is not None and self._has_provider:
+            sql += " AND m.provider = ?"
+            params.append(provider)
 
         # Date filtering: use date range if provided, else days_back
         if date or since or until:
@@ -181,7 +203,8 @@ class ConversationSearch:
         self,
         message_uuid: str,
         depth: int = 3,
-        include_children: bool = False
+        include_children: bool = False,
+        provider: str = "claude",
     ) -> Dict:
         """
         Get contextual messages around a specific message (progressive disclosure)
@@ -194,12 +217,21 @@ class ConversationSearch:
         Returns:
             Dict with the message, ancestors, and optionally children
         """
+        if not self._has_provider and provider != "claude":
+            return {"error": f"Provider {provider} is not present in this legacy index"}
         cursor = self.conn.cursor()
 
         # Get the target message
-        cursor.execute("""
-            SELECT * FROM messages WHERE message_uuid = ?
-        """, (message_uuid,))
+        if self._has_provider:
+            cursor.execute("""
+                SELECT * FROM messages
+                WHERE provider = ? AND message_uuid = ?
+            """, (provider, message_uuid))
+        else:
+            cursor.execute("""
+                SELECT 'claude' AS provider, * FROM messages
+                WHERE message_uuid = ?
+            """, (message_uuid,))
         target = cursor.fetchone()
 
         if not target:
@@ -213,9 +245,16 @@ class ConversationSearch:
         levels = 0
 
         while current_uuid and levels < depth:
-            cursor.execute("""
-                SELECT * FROM messages WHERE message_uuid = ?
-            """, (current_uuid,))
+            if self._has_provider:
+                cursor.execute("""
+                    SELECT * FROM messages
+                    WHERE provider = ? AND message_uuid = ?
+                """, (provider, current_uuid))
+            else:
+                cursor.execute("""
+                    SELECT 'claude' AS provider, * FROM messages
+                    WHERE message_uuid = ?
+                """, (current_uuid,))
             parent = cursor.fetchone()
 
             if not parent:
@@ -228,17 +267,31 @@ class ConversationSearch:
         # Get children (branches from this message)
         children = []
         if include_children:
-            cursor.execute("""
-                SELECT * FROM messages
-                WHERE parent_uuid = ?
-                ORDER BY timestamp ASC
-            """, (message_uuid,))
+            if self._has_provider:
+                cursor.execute("""
+                    SELECT * FROM messages
+                    WHERE provider = ? AND parent_uuid = ?
+                    ORDER BY timestamp ASC
+                """, (provider, message_uuid))
+            else:
+                cursor.execute("""
+                    SELECT 'claude' AS provider, * FROM messages
+                    WHERE parent_uuid = ?
+                    ORDER BY timestamp ASC
+                """, (message_uuid,))
             children = [dict(row) for row in cursor.fetchall()]
 
         # Get conversation metadata
-        cursor.execute("""
-            SELECT * FROM conversations WHERE session_id = ?
-        """, (target_dict['session_id'],))
+        if self._has_provider:
+            cursor.execute("""
+                SELECT * FROM conversations
+                WHERE provider = ? AND session_id = ?
+            """, (provider, target_dict['session_id']))
+        else:
+            cursor.execute("""
+                SELECT 'claude' AS provider, * FROM conversations
+                WHERE session_id = ?
+            """, (target_dict['session_id'],))
         conversation = dict(cursor.fetchone())
 
         return {
@@ -249,27 +302,47 @@ class ConversationSearch:
             "context_depth": len(ancestors)
         }
 
-    def get_conversation_tree(self, session_id: str) -> Dict:
+    def get_conversation_tree(
+        self,
+        session_id: str,
+        provider: str = "claude",
+    ) -> Dict:
         """
         Get the full conversation tree for a session
 
         Returns:
             Tree structure with all messages
         """
+        if not self._has_provider and provider != "claude":
+            return {"error": f"Provider {provider} is not present in this legacy index"}
         cursor = self.conn.cursor()
 
         # Get all messages
-        cursor.execute("""
-            SELECT * FROM messages
-            WHERE session_id = ?
-            ORDER BY timestamp ASC
-        """, (session_id,))
+        if self._has_provider:
+            cursor.execute("""
+                SELECT * FROM messages
+                WHERE provider = ? AND session_id = ?
+                ORDER BY timestamp ASC
+            """, (provider, session_id))
+        else:
+            cursor.execute("""
+                SELECT 'claude' AS provider, * FROM messages
+                WHERE session_id = ?
+                ORDER BY timestamp ASC
+            """, (session_id,))
         messages = [dict(row) for row in cursor.fetchall()]
 
         # Get conversation metadata
-        cursor.execute("""
-            SELECT * FROM conversations WHERE session_id = ?
-        """, (session_id,))
+        if self._has_provider:
+            cursor.execute("""
+                SELECT * FROM conversations
+                WHERE provider = ? AND session_id = ?
+            """, (provider, session_id))
+        else:
+            cursor.execute("""
+                SELECT 'claude' AS provider, * FROM conversations
+                WHERE session_id = ?
+            """, (session_id,))
         conversation = cursor.fetchone()
 
         if not conversation:
@@ -307,7 +380,8 @@ class ConversationSearch:
         until: Optional[str] = None,
         date: Optional[str] = None,
         limit: int = 20,
-        project_path: Optional[str] = None
+        project_path: Optional[str] = None,
+        provider: Optional[str] = "claude",
     ) -> List[Dict]:
         """
         List recent conversations
@@ -323,6 +397,8 @@ class ConversationSearch:
         Returns:
             List of conversation metadata
         """
+        if not self._has_provider and provider not in (None, "claude"):
+            return []
         # Default to 7 days if no filters provided
         if days_back is None and not (since or until or date):
             days_back = 7
@@ -333,11 +409,16 @@ class ConversationSearch:
 
         cursor = self.conn.cursor()
 
-        sql = """
-            SELECT * FROM conversations
+        provider_select = "" if self._has_provider else "'claude' AS provider,"
+        sql = f"""
+            SELECT {provider_select} * FROM conversations
             WHERE 1=1
         """
         params = []
+
+        if provider is not None and self._has_provider:
+            sql += " AND provider = ?"
+            params.append(provider)
 
         # Date filtering
         if date or since or until:
@@ -360,18 +441,34 @@ class ConversationSearch:
         cursor.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_full_message_content(self, message_uuid: str) -> Optional[str]:
+    def get_full_message_content(
+        self,
+        message_uuid: str,
+        provider: str = "claude",
+    ) -> Optional[str]:
         """Get the full content of a message (not just summary)"""
+        if not self._has_provider and provider != "claude":
+            return None
         cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT full_content FROM messages WHERE message_uuid = ?
-        """, (message_uuid,))
+        if self._has_provider:
+            cursor.execute("""
+                SELECT full_content FROM messages
+                WHERE provider = ? AND message_uuid = ?
+            """, (provider, message_uuid))
+        else:
+            cursor.execute("""
+                SELECT full_content FROM messages WHERE message_uuid = ?
+            """, (message_uuid,))
         result = cursor.fetchone()
         return result['full_content'] if result else None
 
-    def get_full_messages(self, uuids: List[str]) -> List[Dict]:
+    def get_full_messages(
+        self,
+        uuids: List[str],
+        provider: str = "claude",
+    ) -> List[Dict]:
         """Batch fetch full content for multiple messages. Supports UUID prefixes."""
-        if not uuids:
+        if not uuids or (not self._has_provider and provider != "claude"):
             return []
 
         cursor = self.conn.cursor()
@@ -380,22 +477,26 @@ class ConversationSearch:
         for uuid in uuids:
             # If it's a short UUID (8 chars), use prefix matching
             if len(uuid) <= 8:
-                cursor.execute("""
+                provider_clause = "provider = ? AND " if self._has_provider else ""
+                params = (provider, f"{uuid}%") if self._has_provider else (f"{uuid}%",)
+                cursor.execute(f"""
                     SELECT message_uuid, full_content, timestamp, message_type,
                            project_path, summary
                     FROM messages
-                    WHERE message_uuid LIKE ?
+                    WHERE {provider_clause}message_uuid LIKE ?
                     ORDER BY timestamp
                     LIMIT 1
-                """, (f"{uuid}%",))
+                """, params)
             else:
                 # Full UUID
-                cursor.execute("""
+                provider_clause = "provider = ? AND " if self._has_provider else ""
+                params = (provider, uuid) if self._has_provider else (uuid,)
+                cursor.execute(f"""
                     SELECT message_uuid, full_content, timestamp, message_type,
                            project_path, summary
                     FROM messages
-                    WHERE message_uuid = ?
-                """, (uuid,))
+                    WHERE {provider_clause}message_uuid = ?
+                """, params)
 
             row = cursor.fetchone()
             if row:
@@ -408,18 +509,22 @@ class ConversationSearch:
         days_back: int = 1,
         project_path: Optional[str] = None,
         max_conversations: int = 10,
-        max_messages_per_conv: int = 50
+        max_messages_per_conv: int = 50,
+        provider: Optional[str] = "claude",
     ) -> str:
         """
         Load recent conversation context for Claude to read directly.
         Returns token-efficient formatted text.
         """
+        if not self._has_provider and provider not in (None, "claude"):
+            return f"No {provider} conversations found in this legacy index."
         cursor = self.conn.cursor()
 
         # Get recent conversations
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
-        sql = """
-            SELECT session_id, conversation_summary, project_path,
+        provider_select = "provider" if self._has_provider else "'claude' AS provider"
+        sql = f"""
+            SELECT {provider_select}, session_id, conversation_summary, project_path,
                    message_count, last_message_at
             FROM conversations
             WHERE last_message_at >= ?
@@ -428,6 +533,10 @@ class ConversationSearch:
                 AND message_count > 2
         """
         params = [cutoff]
+
+        if provider is not None and self._has_provider:
+            sql += " AND provider = ?"
+            params.append(provider)
 
         # Filter out daemon internal conversations (Haiku summarization calls)
         sql += " AND NOT (project_path LIKE '%claude/finder' AND message_count < 5)"
@@ -450,14 +559,21 @@ class ConversationSearch:
 
         for conv in conversations:
             # Get messages for this conversation
-            cursor.execute("""
+            provider_clause = "provider = ? AND " if self._has_provider else ""
+            message_params = (
+                (conv["provider"], conv["session_id"], max_messages_per_conv)
+                if self._has_provider
+                else (conv["session_id"], max_messages_per_conv)
+            )
+            cursor.execute(f"""
                 SELECT message_uuid, timestamp, message_type, summary,
                        is_sidechain, project_path, is_tool_noise
                 FROM messages
-                WHERE session_id = ? AND is_tool_noise = FALSE AND is_meta_conversation = FALSE
+                WHERE {provider_clause}session_id = ?
+                  AND is_tool_noise = FALSE AND is_meta_conversation = FALSE
                 ORDER BY timestamp DESC
                 LIMIT ?
-            """, (conv['session_id'], max_messages_per_conv))
+            """, message_params)
 
             messages = [dict(row) for row in cursor.fetchall()]
             messages.reverse()  # Chronological order

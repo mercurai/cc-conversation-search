@@ -23,12 +23,17 @@ sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/plu
 # Update marketplace.json
 sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/marketplace.json
 
+# Update Codex plugin manifest
+sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .codex-plugin/plugin.json
+
 echo "Updated version to $NEW_VERSION in:"
 echo "  - pyproject.toml"
 echo "  - .claude-plugin/plugin.json"
 echo "  - .claude-plugin/marketplace.json"
+echo "  - .codex-plugin/plugin.json"
 
 # Verify
 echo ""
 echo "Verification:"
-grep -n "version.*$NEW_VERSION" pyproject.toml .claude-plugin/*.json
+grep -n "version.*$NEW_VERSION" \
+    pyproject.toml .claude-plugin/*.json .codex-plugin/plugin.json

@@ -5,7 +5,7 @@ import pytest
 import sqlite3
 import tempfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from conversation_search.core.indexer import ConversationIndexer
 from conversation_search.core.search import ConversationSearch
 
@@ -25,13 +25,17 @@ def temp_db():
 @pytest.fixture
 def indexer(temp_db):
     """Create an indexer with temp database"""
-    return ConversationIndexer(db_path=temp_db, quiet=True)
+    value = ConversationIndexer(db_path=temp_db, quiet=True)
+    yield value
+    value.close()
 
 
 @pytest.fixture
 def search_engine(temp_db):
     """Create a search engine with temp database"""
-    return ConversationSearch(db_path=temp_db)
+    value = ConversationSearch(db_path=temp_db)
+    yield value
+    value.close()
 
 
 class TestFullContentFTSIndexing:
@@ -290,8 +294,16 @@ class TestSearchWithSnippets:
         assert len(results_small) == len(results_large)
 
         # But different snippet sizes
-        small_snippet = results_small[0]['context_snippet']
-        large_snippet = results_large[0]['context_snippet']
+        small_snippet = next(
+            result["context_snippet"]
+            for result in results_small
+            if result["message_uuid"] == "msg-3"
+        )
+        large_snippet = next(
+            result["context_snippet"]
+            for result in results_large
+            if result["message_uuid"] == "msg-3"
+        )
         assert len(small_snippet) < len(large_snippet)
 
 
@@ -381,7 +393,7 @@ class TestDateFilteringWithFullContent:
             ))
 
         # Insert old message
-        old_time = datetime(2025, 10, 1, 12, 0, 0)
+        old_time = datetime.now() - timedelta(days=30)
         cursor.execute("""
             INSERT INTO messages (
                 message_uuid, session_id, timestamp, message_type,
@@ -397,7 +409,7 @@ class TestDateFilteringWithFullContent:
         ))
 
         # Insert recent message
-        recent_time = datetime(2025, 11, 14, 12, 0, 0)
+        recent_time = datetime.now() - timedelta(days=1)
         cursor.execute("""
             INSERT INTO messages (
                 message_uuid, session_id, timestamp, message_type,
@@ -414,7 +426,7 @@ class TestDateFilteringWithFullContent:
 
         indexer.conn.commit()
 
-        # Search with date filter (last 7 days from Nov 14)
+        # Search with a rolling seven-day date filter.
         results = search_engine.search_conversations(
             'KEYWORD',
             days_back=7

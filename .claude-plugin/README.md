@@ -1,6 +1,8 @@
 # Conversation Search Plugin
 
-This plugin provides semantic search across your Claude Code conversation history with progressive exploration strategies. Mercurai fork of [`akatz-ai/cc-conversation-search`](https://github.com/akatz-ai/cc-conversation-search) with additional Claude- and Codex-side session-mining hooks.
+This plugin provides provider-aware search and bounded, redacted transcript
+mining across Claude Code and Codex history. It is Mercurai's fork of
+[`akatz-ai/cc-conversation-search`](https://github.com/akatz-ai/cc-conversation-search).
 
 ## Three layers, three update paths
 
@@ -12,7 +14,9 @@ There are three independent install layers; understanding which layer needs an u
 | **Installed CLI** | The `cc-conversation-search` executable on your PATH (a `uv tool` venv built from this fork) | `bash ~/plugins/cc-conversation-search/install.sh` (do **not** use `uv tool upgrade cc-conversation-search` — see Updates section) |
 | **Plugin registration** | Claude Code's plugin index that exposes the skill to your sessions | `/plugin update conversation-search` from inside Claude Code |
 
-A `git pull` does **not** refresh the installed CLI. A `/plugin update` does **not** refresh the installed CLI either. Only `bash install.sh` (or `uv tool upgrade …`) changes which version of the binary `cc-conversation-search --version` reports.
+A `git pull` does **not** refresh the installed CLI. A `/plugin update` does
+**not** refresh it either. Only this repository's `bash install.sh` refreshes
+the installed fork.
 
 ## Installation
 
@@ -35,15 +39,13 @@ This will:
 ### Option 2: Manual Installation
 
 1. Clone the repository
-2. Install the CLI tool:
+2. Install this repository's CLI build:
    ```bash
-   uv tool install cc-conversation-search
-   # OR
-   pip install cc-conversation-search
+   bash install.sh
    ```
-3. Initialize the database:
+3. Initialize one or both providers:
    ```bash
-   cc-conversation-search init
+   cc-conversation-search init --provider all
    ```
 4. Copy the skill to Claude Code:
    ```bash
@@ -66,16 +68,22 @@ bash ~/plugins/cc-conversation-search/install.sh
 
 Do not run `uv tool upgrade cc-conversation-search` — that re-resolves from PyPI and would replace the mercurai build with the upstream package.
 
+Pinned configuration managers should invoke
+`install.sh --managed-checkout`. That mode installs from the invoking checkout
+without Git network or redirect operations and verifies the enabled Codex
+plugin source against the exact checkout.
+
 If `cc-conversation-search` is on your PATH but fails, see the **Recovery** section in `INSTALL.md` — the most common failure mode is a launcher left over from a removed `uv tool` environment.
 
 ## What's Included
 
-- **Skill**: conversation-search (with progressive search workflow)
-- **CLI Tool**: conversation-search command-line interface
-- **Database**: Local SQLite index of conversations
+- **Skills**: `conversation-search`, generic `session-miner`, and explicit
+  `claude-session-miner` / `codex-session-miner`
+- **CLI Tool**: `cc-conversation-search`
+- **Database**: Local provider-qualified SQLite index
 
 ## Requirements
 
-- Claude Code
+- Claude Code and/or Codex transcripts
 - Python 3.9+
-- Either `uv` or `pip` for installation
+- `uv` for the repository installer

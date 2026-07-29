@@ -12,6 +12,18 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
+for manifest in \
+    .claude-plugin/plugin.json \
+    .claude-plugin/marketplace.json \
+    .codex-plugin/plugin.json
+do
+    if ! grep -q "\"version\": \"${VERSION}\"" "${manifest}"; then
+        echo "Error: ${manifest} is not at version ${VERSION}"
+        echo "Run: ./scripts/bump-version.sh ${VERSION}"
+        exit 1
+    fi
+done
+
 # Check if version exists on PyPI
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/cc-conversation-search/${VERSION}/json")
 
@@ -22,6 +34,7 @@ if [ "$HTTP_STATUS" = "200" ]; then
     echo "Also update plugin versions in:"
     echo "  - .claude-plugin/plugin.json"
     echo "  - .claude-plugin/marketplace.json"
+    echo "  - .codex-plugin/plugin.json"
     exit 1
 fi
 
