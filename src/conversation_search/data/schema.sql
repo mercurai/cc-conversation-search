@@ -101,6 +101,19 @@ CREATE INDEX IF NOT EXISTS idx_conv_provider
     ON conversations(provider, last_message_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conv_last_message ON conversations(last_message_at DESC);
 
+-- What each transcript file looked like when it was last processed. A file whose
+-- mtime, size and index_version still match is skipped without being parsed,
+-- whatever the outcome of that processing was (indexed, unchanged, no messages, ...).
+CREATE TABLE IF NOT EXISTS transcript_files (
+    path TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    file_mtime_ns INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    index_version INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    stamped_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Processing queue for new/updated files
 CREATE TABLE IF NOT EXISTS index_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

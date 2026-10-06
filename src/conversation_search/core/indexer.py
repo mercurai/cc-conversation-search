@@ -7,6 +7,7 @@ Scans selected Claude Code and Codex transcript roots and indexes conversations
 import json
 import os
 import sqlite3
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -22,6 +23,11 @@ from conversation_search.core.summarization import (
     is_summarizer_conversation,
     message_uses_conversation_search
 )
+
+
+# Bump when a parser starts emitting different messages for the same transcript;
+# every stamped file is re-parsed once the version no longer matches.
+INDEX_VERSION = 1
 
 
 class ConversationIndexer:
@@ -327,18 +333,19 @@ class ConversationIndexer:
         """Calculate depth of each message from root"""
         depths = {}
 
-        # Find roots (messages with no parent)
-        roots = [m['uuid'] for m in messages if not m['parent_uuid']]
+        # Children by parent, roots under None; one pass instead of a scan per message
+        children: Dict[Optional[str], List[str]] = {}
+        for m in messages:
+            children.setdefault(m['parent_uuid'] or None, []).append(m['uuid'])
 
-        # BFS to calculate depths
-        queue = [(root_uuid, 0) for root_uuid in roots]
+        # BFS to calculate depths; a uuid reached twice (duplicate line, cycle) keeps its first depth
+        queue = deque((root_uuid, 0) for root_uuid in children.get(None, []))
         while queue:
-            uuid, depth = queue.pop(0)
+            uuid, depth = queue.popleft()
+            if uuid in depths:
+                continue
             depths[uuid] = depth
-
-            # Find children
-            children = [m['uuid'] for m in messages if m['parent_uuid'] == uuid]
-            for child_uuid in children:
+            for child_uuid in children.get(uuid, []):
                 queue.append((child_uuid, depth + 1))
 
         return depths
@@ -479,15 +486,52 @@ class ConversationIndexer:
 
         return meta_uuids
 
+    def _file_signature(self, file_path: Path) -> Tuple[int, int]:
+        """(mtime_ns, size) of the transcript; taken before parsing so a file that grows mid-parse is re-indexed next time"""
+        stat = file_path.stat()
+        return stat.st_mtime_ns, stat.st_size
+
+    def _is_unchanged_since_index(self, cursor, file_path: Path, signature: Tuple[int, int]) -> bool:
+        cursor.execute(
+            "SELECT file_mtime_ns, file_size, index_version FROM transcript_files WHERE path = ?",
+            (str(file_path),)
+        )
+        row = cursor.fetchone()
+        return row is not None and tuple(row) == (signature[0], signature[1], INDEX_VERSION)
+
+    def _stamp_file(self, cursor, provider: str, file_path: Path, signature: Tuple[int, int], outcome: str) -> None:
+        """Record what this file content produced; every exit of index_conversation stamps so no unchanged file is parsed twice"""
+        cursor.execute("""
+            INSERT OR REPLACE INTO transcript_files (
+                path, provider, file_mtime_ns, file_size, index_version, outcome
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (str(file_path), provider, signature[0], signature[1], INDEX_VERSION, outcome))
+        self.conn.commit()
+
     def index_conversation(
         self,
         file_path: Path,
         summarize: bool = True,
-        provider: str = "claude",
+        provider: Optional[str] = "claude",
     ):
-        """Index a single conversation file with batch summarization"""
+        """Index a single conversation file with batch summarization.
+
+        provider=None detects it from the file, after the unchanged check, so a
+        skipped file is never opened.
+        """
         if not self.quiet:
             print(f"Indexing: {file_path}")
+
+        # Skip without parsing when the file is byte-for-byte what we last indexed
+        signature = self._file_signature(file_path)
+        cursor = self.conn.cursor()
+        if self._is_unchanged_since_index(cursor, file_path, signature):
+            if not self.quiet:
+                print(f"  Unchanged since last index, skipping")
+            return
+
+        if provider is None:
+            provider = detect_transcript_provider(file_path)
 
         # Parse file
         conv_meta, messages = self.parse_conversation_file(file_path, provider=provider)
@@ -495,12 +539,14 @@ class ConversationIndexer:
         if not messages:
             if not self.quiet:
                 print(f"  No messages found in {file_path}")
+            self._stamp_file(cursor, provider, file_path, signature, "no-messages")
             return
 
         # Skip summarizer conversations
         if provider == "claude" and is_summarizer_conversation(file_path, messages):
             if not self.quiet:
                 print(f"  ⏭️  Skipping automated summarizer conversation")
+            self._stamp_file(cursor, provider, file_path, signature, "summarizer")
             return
 
         # Mark meta-conversations (search pairs)
@@ -521,14 +567,12 @@ class ConversationIndexer:
         if not session_id:
             if not self.quiet:
                 print(f"  No session_id found in {file_path}")
+            self._stamp_file(cursor, provider, file_path, signature, "no-session-id")
             return
 
         # Calculate depths
         parent_map = {m['uuid']: m['parent_uuid'] for m in messages}
         depths = self.calculate_depth(messages, parent_map)
-
-        # Index conversation metadata
-        cursor = self.conn.cursor()
 
         # Check if already indexed
         cursor.execute(
@@ -555,6 +599,7 @@ class ConversationIndexer:
             if not new_messages:
                 if not self.quiet:
                     print(f"  No new messages, skipping")
+                self._stamp_file(cursor, provider, file_path, signature, "unchanged")
                 return
 
             if not self.quiet:
@@ -609,11 +654,13 @@ class ConversationIndexer:
             if self.summarizer.is_tool_noise(message):
                 tool_noise_uuids.append(message['uuid'])
 
-        # Insert all messages in a single transaction
+        # Insert all messages in a single transaction. OR IGNORE: forked Codex
+        # rollouts and some Claude transcripts repeat a message id; the first
+        # copy wins instead of the whole file failing and never indexing.
         try:
             for message in messages:
                 cursor.execute("""
-                    INSERT INTO messages (
+                    INSERT OR IGNORE INTO messages (
                         provider, message_uuid, session_id, parent_uuid, is_sidechain,
                         depth, timestamp, message_type, project_path,
                         conversation_file, full_content, is_meta_conversation,
@@ -635,8 +682,18 @@ class ConversationIndexer:
                     message['uuid'] in tool_noise_uuids
                 ))
 
+            # OR IGNORE may have skipped rows: store the count that is actually there
+            cursor.execute("""
+                UPDATE conversations
+                SET message_count = (
+                    SELECT count(*) FROM messages WHERE provider = ? AND session_id = ?
+                )
+                WHERE provider = ? AND session_id = ?
+            """, (provider, session_id, provider, session_id))
+
             # Commit once at the end
             self.conn.commit()
+            self._stamp_file(cursor, provider, file_path, signature, "indexed")
 
             if tool_noise_uuids and not self.quiet:
                 print(f"  Marked {len(tool_noise_uuids)} messages as tool noise")
@@ -668,11 +725,7 @@ class ConversationIndexer:
             if not self.quiet:
                 print(f"\n[{i}/{len(files)}]")
             try:
-                provider = (
-                    providers[0]
-                    if len(providers) == 1
-                    else detect_transcript_provider(file_path)
-                )
+                provider = providers[0] if len(providers) == 1 else None
                 self.index_conversation(
                     file_path,
                     summarize=summarize,
