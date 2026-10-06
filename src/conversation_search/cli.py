@@ -440,7 +440,15 @@ def cmd_mine_session(args):
     )
 
 
+def _configure_stdio() -> None:
+    """Emit UTF-8 whatever the console code page: a piped stdout on Windows defaults to cp1252 and the emoji headers raise UnicodeEncodeError"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv=None):
+    _configure_stdio()
     parser = argparse.ArgumentParser(
         prog='cc-conversation-search',
         description='Find, resume, and mine Claude Code and Codex conversations'

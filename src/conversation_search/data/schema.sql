@@ -92,11 +92,15 @@ CREATE TABLE IF NOT EXISTS conversations (
     last_message_at TEXT,
     message_count INTEGER DEFAULT 0,
     indexed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    -- Source file signature at index time; an unchanged file is skipped without parsing
+    file_mtime_ns INTEGER,
+    file_size INTEGER,
 
     PRIMARY KEY (provider, session_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_path);
+CREATE INDEX IF NOT EXISTS idx_conv_file ON conversations(conversation_file);
 CREATE INDEX IF NOT EXISTS idx_conv_provider
     ON conversations(provider, last_message_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conv_last_message ON conversations(last_message_at DESC);

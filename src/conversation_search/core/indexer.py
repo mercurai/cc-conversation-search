@@ -63,6 +63,13 @@ class ConversationIndexer:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Migration: file signature columns so unchanged files skip re-parsing
+        for column in ("file_mtime_ns INTEGER", "file_size INTEGER"):
+            try:
+                self.conn.execute(f"ALTER TABLE conversations ADD COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
         self.conn.commit()
 
     def _migrate_provider_schema(self, schema_sql: str, message_columns: set) -> None:
@@ -479,6 +486,26 @@ class ConversationIndexer:
 
         return meta_uuids
 
+    def _file_signature(self, file_path: Path) -> Tuple[int, int]:
+        """(mtime_ns, size) of the transcript; taken before parsing so a file that grows mid-parse is re-indexed next time"""
+        stat = file_path.stat()
+        return stat.st_mtime_ns, stat.st_size
+
+    def _is_unchanged_since_index(self, cursor, file_path: Path, signature: Tuple[int, int]) -> bool:
+        cursor.execute(
+            "SELECT file_mtime_ns, file_size FROM conversations WHERE conversation_file = ?",
+            (str(file_path),)
+        )
+        row = cursor.fetchone()
+        return row is not None and (row["file_mtime_ns"], row["file_size"]) == signature
+
+    def _stamp_file_signature(self, cursor, provider: str, session_id: str, file_path: Path, signature: Tuple[int, int]) -> None:
+        cursor.execute("""
+            UPDATE conversations
+            SET conversation_file = ?, file_mtime_ns = ?, file_size = ?
+            WHERE provider = ? AND session_id = ?
+        """, (str(file_path), signature[0], signature[1], provider, session_id))
+
     def index_conversation(
         self,
         file_path: Path,
@@ -488,6 +515,14 @@ class ConversationIndexer:
         """Index a single conversation file with batch summarization"""
         if not self.quiet:
             print(f"Indexing: {file_path}")
+
+        # Skip without parsing when the file is byte-for-byte what we last indexed
+        signature = self._file_signature(file_path)
+        cursor = self.conn.cursor()
+        if self._is_unchanged_since_index(cursor, file_path, signature):
+            if not self.quiet:
+                print(f"  Unchanged since last index, skipping")
+            return
 
         # Parse file
         conv_meta, messages = self.parse_conversation_file(file_path, provider=provider)
@@ -527,9 +562,6 @@ class ConversationIndexer:
         parent_map = {m['uuid']: m['parent_uuid'] for m in messages}
         depths = self.calculate_depth(messages, parent_map)
 
-        # Index conversation metadata
-        cursor = self.conn.cursor()
-
         # Check if already indexed
         cursor.execute(
             "SELECT indexed_at FROM conversations WHERE provider = ? AND session_id = ?",
@@ -555,6 +587,8 @@ class ConversationIndexer:
             if not new_messages:
                 if not self.quiet:
                     print(f"  No new messages, skipping")
+                self._stamp_file_signature(cursor, provider, session_id, file_path, signature)
+                self.conn.commit()
                 return
 
             if not self.quiet:
@@ -571,12 +605,18 @@ class ConversationIndexer:
                 SET last_message_at = ?,
                     message_count = ?,
                     leaf_message_uuid = ?,
+                    conversation_file = ?,
+                    file_mtime_ns = ?,
+                    file_size = ?,
                     indexed_at = CURRENT_TIMESTAMP
                 WHERE provider = ? AND session_id = ?
             """, (
                 all_messages[-1]['timestamp'],
                 len(existing_uuids) + len(new_messages),
                 conv_meta.get('leafUuid') if conv_meta else None,
+                str(file_path),
+                signature[0],
+                signature[1],
                 provider,
                 session_id
             ))
@@ -588,8 +628,9 @@ class ConversationIndexer:
                 INSERT INTO conversations (
                     provider, session_id, project_path, conversation_file,
                     root_message_uuid, leaf_message_uuid, conversation_summary,
-                    first_message_at, last_message_at, message_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    first_message_at, last_message_at, message_count,
+                    file_mtime_ns, file_size
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 provider,
                 session_id,
@@ -600,7 +641,9 @@ class ConversationIndexer:
                 conv_meta.get('summary', 'Untitled conversation') if conv_meta else None,
                 messages[0]['timestamp'],
                 messages[-1]['timestamp'],
-                len(messages)
+                len(messages),
+                signature[0],
+                signature[1]
             ))
 
         # Classify messages for tool noise filtering
