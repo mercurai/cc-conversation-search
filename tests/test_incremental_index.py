@@ -194,6 +194,7 @@ def test_duplicate_message_uuid_indexes_once_and_skips(tmp_path, monkeypatch):
             "SELECT count(*) FROM messages WHERE session_id = ?", (SESSION_ID,)
         ).fetchone()[0]
         assert stored == 4
+        assert _message_count(indexer) == 4
         assert _stamp(indexer, transcript)["outcome"] == "indexed"
 
         indexer.index_conversation(transcript)
@@ -235,6 +236,61 @@ def test_database_indexed_before_stamps_reparses_once(tmp_path, monkeypatch):
         assert _stamp(indexer, transcript)["outcome"] == "unchanged"
         indexer.index_conversation(transcript)
         assert len(calls) == 2
+    finally:
+        indexer.close()
+
+
+def test_fork_indexed_before_parent_counts_stored_rows(tmp_path, monkeypatch):
+    parent = tmp_path / "parent.jsonl"
+    _write_transcript(parent, turns=4)
+    fork_rows = [dict(r, sessionId="fork-session") if "uuid" in r else r for r in _rows(4)]
+    fork = tmp_path / "fork.jsonl"
+    _write_rows(fork, fork_rows)  # same message ids under another session, as forked rollouts do
+    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
+    calls = _parse_counter(indexer, monkeypatch)
+    try:
+        indexer.index_conversation(fork)
+        indexer.index_conversation(parent)
+        counts = dict(
+            indexer.conn.execute("SELECT session_id, message_count FROM conversations").fetchall()
+        )
+        assert counts == {"fork-session": 4, SESSION_ID: 0}
+        assert _stamp(indexer, parent)["outcome"] == "indexed"
+
+        indexer.index_conversation(parent)
+        assert len(calls) == 2
+    finally:
+        indexer.close()
+
+
+def test_summarizer_transcript_is_stamped_and_skipped(tmp_path, monkeypatch):
+    transcript = tmp_path / "summarizer.jsonl"
+    rows = _rows(2)
+    rows[1]["message"]["content"] = "Summarize this conversation. Messages to summarize: ..."
+    _write_rows(transcript, rows)
+    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
+    calls = _parse_counter(indexer, monkeypatch)
+    try:
+        indexer.index_conversation(transcript)
+        indexer.index_conversation(transcript)
+        assert calls == [transcript]
+        assert _stamp(indexer, transcript)["outcome"] == "summarizer"
+        assert indexer.conn.execute("SELECT count(*) FROM conversations").fetchone()[0] == 0
+    finally:
+        indexer.close()
+
+
+def test_transcript_without_session_id_is_stamped_and_skipped(tmp_path, monkeypatch):
+    transcript = tmp_path / "no-session.jsonl"
+    rows = [{k: v for k, v in r.items() if k != "sessionId"} for r in _rows(4)]
+    _write_rows(transcript, rows)
+    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
+    calls = _parse_counter(indexer, monkeypatch)
+    try:
+        indexer.index_conversation(transcript)
+        indexer.index_conversation(transcript)
+        assert calls == [transcript]
+        assert _stamp(indexer, transcript)["outcome"] == "no-session-id"
     finally:
         indexer.close()
 

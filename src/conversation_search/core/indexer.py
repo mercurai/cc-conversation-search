@@ -673,6 +673,15 @@ class ConversationIndexer:
                     message['uuid'] in tool_noise_uuids
                 ))
 
+            # OR IGNORE may have skipped rows: store the count that is actually there
+            cursor.execute("""
+                UPDATE conversations
+                SET message_count = (
+                    SELECT count(*) FROM messages WHERE provider = ? AND session_id = ?
+                )
+                WHERE provider = ? AND session_id = ?
+            """, (provider, session_id, provider, session_id))
+
             # Commit once at the end
             self.conn.commit()
             self._stamp_file(cursor, provider, file_path, signature, "indexed")
