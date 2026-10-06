@@ -7,6 +7,7 @@ Scans selected Claude Code and Codex transcript roots and indexes conversations
 import json
 import os
 import sqlite3
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -332,18 +333,19 @@ class ConversationIndexer:
         """Calculate depth of each message from root"""
         depths = {}
 
-        # Find roots (messages with no parent)
-        roots = [m['uuid'] for m in messages if not m['parent_uuid']]
+        # Children by parent, roots under None; one pass instead of a scan per message
+        children: Dict[Optional[str], List[str]] = {}
+        for m in messages:
+            children.setdefault(m['parent_uuid'] or None, []).append(m['uuid'])
 
-        # BFS to calculate depths
-        queue = [(root_uuid, 0) for root_uuid in roots]
+        # BFS to calculate depths; a uuid reached twice (duplicate line, cycle) keeps its first depth
+        queue = deque((root_uuid, 0) for root_uuid in children.get(None, []))
         while queue:
-            uuid, depth = queue.pop(0)
+            uuid, depth = queue.popleft()
+            if uuid in depths:
+                continue
             depths[uuid] = depth
-
-            # Find children
-            children = [m['uuid'] for m in messages if m['parent_uuid'] == uuid]
-            for child_uuid in children:
+            for child_uuid in children.get(uuid, []):
                 queue.append((child_uuid, depth + 1))
 
         return depths

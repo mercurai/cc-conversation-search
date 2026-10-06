@@ -295,6 +295,29 @@ def test_transcript_without_session_id_is_stamped_and_skipped(tmp_path, monkeypa
         indexer.close()
 
 
+def test_calculate_depth_handles_branches_duplicates_and_cycles(tmp_path):
+    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
+    try:
+        messages = [
+            {"uuid": "r", "parent_uuid": None},
+            {"uuid": "a", "parent_uuid": "r"},
+            {"uuid": "b", "parent_uuid": "r"},
+            {"uuid": "c", "parent_uuid": "a"},
+            {"uuid": "c", "parent_uuid": "a"},  # duplicated line
+            {"uuid": "x", "parent_uuid": "y"},  # cycle, unreachable from a root
+            {"uuid": "y", "parent_uuid": "x"},
+            {"uuid": "s", "parent_uuid": ""},  # empty parent counts as a root
+        ]
+        depths = indexer.calculate_depth(messages, {m["uuid"]: m["parent_uuid"] for m in messages})
+        assert depths == {"r": 0, "a": 1, "b": 1, "c": 2, "s": 0}
+
+        chain = [{"uuid": f"m{i}", "parent_uuid": f"m{i - 1}" if i else None} for i in range(20_000)]
+        depths = indexer.calculate_depth(chain, {m["uuid"]: m["parent_uuid"] for m in chain})
+        assert depths["m19999"] == 19_999
+    finally:
+        indexer.close()
+
+
 def test_search_output_survives_cp1252_stdout(tmp_path):
     transcript = tmp_path / "session.jsonl"
     _write_transcript(transcript, turns=4)
