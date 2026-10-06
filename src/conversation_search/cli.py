@@ -15,6 +15,7 @@ from conversation_search.core.providers import detect_transcript_provider, get_p
 from conversation_search.core.search import ConversationSearch, format_timestamp
 from conversation_search.core.session_miner import (
     add_mine_session_args,
+    configure_stdio,
     run_mine_session,
 )
 
@@ -440,15 +441,9 @@ def cmd_mine_session(args):
     )
 
 
-def _configure_stdio() -> None:
-    """Emit UTF-8 whatever the console code page: a piped stdout on Windows defaults to cp1252 and the emoji headers raise UnicodeEncodeError"""
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-
-
 def main(argv=None):
-    _configure_stdio()
+    # A piped stdout on Windows defaults to cp1252 and the emoji headers raise UnicodeEncodeError
+    configure_stdio()
     parser = argparse.ArgumentParser(
         prog='cc-conversation-search',
         description='Find, resume, and mine Claude Code and Codex conversations'

@@ -2,10 +2,12 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from conversation_search.core import indexer as indexer_module
 from conversation_search.core.indexer import ConversationIndexer
 
 SESSION_ID = "11111111-2222-3333-4444-555555555555"
@@ -23,7 +25,7 @@ def _record(uuid, parent, role, text, stamp):
     }
 
 
-def _write_transcript(path: Path, turns: int) -> None:
+def _rows(turns: int):
     rows = [
         {"type": "summary", "summary": "Incremental fixture", "leafUuid": f"m{turns}"}
     ]
@@ -32,7 +34,15 @@ def _write_transcript(path: Path, turns: int) -> None:
         role = "user" if i % 2 else "assistant"
         rows.append(_record(f"m{i}", parent, role, f"turn {i} about the widget", i))
         parent = f"m{i}"
+    return rows
+
+
+def _write_rows(path: Path, rows) -> None:
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+def _write_transcript(path: Path, turns: int) -> None:
+    _write_rows(path, _rows(turns))
 
 
 def _bump_mtime(path: Path) -> None:
@@ -52,38 +62,47 @@ def _parse_counter(indexer, monkeypatch):
     return calls
 
 
-def _signature_row(indexer, transcript):
+def _stamp(indexer, path):
     return indexer.conn.execute(
-        "SELECT message_count, file_mtime_ns, file_size FROM conversations WHERE conversation_file = ?",
-        (str(transcript),),
+        "SELECT file_mtime_ns, file_size, index_version, outcome FROM transcript_files WHERE path = ?",
+        (str(path),),
     ).fetchone()
 
 
-def test_unchanged_file_is_skipped_without_parsing(tmp_path, monkeypatch):
+def _message_count(indexer):
+    return indexer.conn.execute(
+        "SELECT message_count FROM conversations WHERE session_id = ?", (SESSION_ID,)
+    ).fetchone()["message_count"]
+
+
+def _fresh(tmp_path, monkeypatch, turns=4):
     transcript = tmp_path / "session.jsonl"
-    _write_transcript(transcript, turns=4)
+    _write_transcript(transcript, turns)
     indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
-    calls = _parse_counter(indexer, monkeypatch)
+    return transcript, indexer, _parse_counter(indexer, monkeypatch)
+
+
+def test_unchanged_file_is_skipped_without_parsing(tmp_path, monkeypatch):
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
     try:
         indexer.index_conversation(transcript)
         indexer.index_conversation(transcript)
         assert calls == [transcript]
 
-        row = _signature_row(indexer, transcript)
-        assert row["message_count"] == 4
-        assert (row["file_mtime_ns"], row["file_size"]) == (
+        row = _stamp(indexer, transcript)
+        assert tuple(row) == (
             transcript.stat().st_mtime_ns,
             transcript.stat().st_size,
+            indexer_module.INDEX_VERSION,
+            "indexed",
         )
+        assert _message_count(indexer) == 4
     finally:
         indexer.close()
 
 
 def test_modified_file_is_reparsed_and_restamped(tmp_path, monkeypatch):
-    transcript = tmp_path / "session.jsonl"
-    _write_transcript(transcript, turns=4)
-    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
-    calls = _parse_counter(indexer, monkeypatch)
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
     try:
         indexer.index_conversation(transcript)
 
@@ -91,12 +110,10 @@ def test_modified_file_is_reparsed_and_restamped(tmp_path, monkeypatch):
         _bump_mtime(transcript)
         indexer.index_conversation(transcript)
         assert calls == [transcript, transcript]
-
-        row = _signature_row(indexer, transcript)
-        assert row["message_count"] == 6
-        assert (row["file_mtime_ns"], row["file_size"]) == (
-            transcript.stat().st_mtime_ns,
-            transcript.stat().st_size,
+        assert _message_count(indexer) == 6
+        assert (
+            _stamp(indexer, transcript)["file_mtime_ns"]
+            == transcript.stat().st_mtime_ns
         )
 
         indexer.index_conversation(transcript)  # unchanged again
@@ -105,50 +122,121 @@ def test_modified_file_is_reparsed_and_restamped(tmp_path, monkeypatch):
         indexer.close()
 
 
+def test_size_change_with_same_mtime_is_detected(tmp_path, monkeypatch):
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
+    try:
+        indexer.index_conversation(transcript)
+        stat = transcript.stat()
+
+        _write_transcript(transcript, turns=6)
+        os.utime(
+            transcript, ns=(stat.st_atime_ns, stat.st_mtime_ns)
+        )  # mtime restored, size differs
+        indexer.index_conversation(transcript)
+        assert len(calls) == 2
+        assert _message_count(indexer) == 6
+    finally:
+        indexer.close()
+
+
 def test_touched_file_with_no_new_messages_is_restamped(tmp_path, monkeypatch):
-    transcript = tmp_path / "session.jsonl"
-    _write_transcript(transcript, turns=4)
-    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
-    calls = _parse_counter(indexer, monkeypatch)
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
     try:
         indexer.index_conversation(transcript)
         _bump_mtime(transcript)
 
         indexer.index_conversation(transcript)  # parses, finds nothing new, restamps
+        assert _stamp(indexer, transcript)["outcome"] == "unchanged"
         indexer.index_conversation(transcript)  # skipped on the new signature
         assert len(calls) == 2
-        assert (
-            _signature_row(indexer, transcript)["file_mtime_ns"]
-            == transcript.stat().st_mtime_ns
-        )
     finally:
         indexer.close()
 
 
-def test_legacy_database_gains_signature_columns(tmp_path):
-    transcript = tmp_path / "session.jsonl"
-    _write_transcript(transcript, turns=2)
-    db_path = tmp_path / "legacy.db"
-    indexer = ConversationIndexer(db_path=str(db_path), quiet=True)
-    indexer.conn.execute("ALTER TABLE conversations DROP COLUMN file_mtime_ns")
-    indexer.conn.execute("ALTER TABLE conversations DROP COLUMN file_size")
-    indexer.conn.commit()
-    indexer.close()
-
-    reopened = ConversationIndexer(db_path=str(db_path), quiet=True)
+def test_file_without_messages_is_stamped_and_skipped(tmp_path, monkeypatch):
+    transcript = tmp_path / "empty.jsonl"
+    _write_rows(transcript, _rows(0))  # summary line only
+    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
+    calls = _parse_counter(indexer, monkeypatch)
     try:
-        columns = {
-            row["name"]
-            for row in reopened.conn.execute("PRAGMA table_info(conversations)")
-        }
-        assert {"file_mtime_ns", "file_size"} <= columns
-        reopened.index_conversation(transcript)
-        assert (
-            _signature_row(reopened, transcript)["file_size"]
-            == transcript.stat().st_size
-        )
+        indexer.index_conversation(transcript)
+        indexer.index_conversation(transcript)
+        assert calls == [transcript]
+        assert _stamp(indexer, transcript)["outcome"] == "no-messages"
     finally:
-        reopened.close()
+        indexer.close()
+
+
+def test_two_files_for_one_session_each_skip(tmp_path, monkeypatch):
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
+    copy = tmp_path / "copy.jsonl"
+    shutil.copy(transcript, copy)
+    try:
+        for path in (transcript, copy, transcript, copy):
+            indexer.index_conversation(path)
+        assert calls == [transcript, copy]
+        assert _stamp(indexer, transcript)["outcome"] == "indexed"
+        assert _stamp(indexer, copy)["outcome"] == "unchanged"
+    finally:
+        indexer.close()
+
+
+def test_duplicate_message_uuid_indexes_once_and_skips(tmp_path, monkeypatch):
+    transcript = tmp_path / "dup.jsonl"
+    rows = _rows(4)
+    rows.append(dict(rows[2]))  # the same uuid twice, as forked rollouts produce
+    _write_rows(transcript, rows)
+    indexer = ConversationIndexer(db_path=str(tmp_path / "index.db"), quiet=True)
+    calls = _parse_counter(indexer, monkeypatch)
+    try:
+        indexer.index_conversation(transcript)
+        stored = indexer.conn.execute(
+            "SELECT count(*) FROM messages WHERE session_id = ?", (SESSION_ID,)
+        ).fetchone()[0]
+        assert stored == 4
+        assert _stamp(indexer, transcript)["outcome"] == "indexed"
+
+        indexer.index_conversation(transcript)
+        assert len(calls) == 1
+    finally:
+        indexer.close()
+
+
+def test_index_version_bump_forces_reparse(tmp_path, monkeypatch):
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
+    try:
+        indexer.index_conversation(transcript)
+        monkeypatch.setattr(
+            indexer_module, "INDEX_VERSION", indexer_module.INDEX_VERSION + 1
+        )
+
+        indexer.index_conversation(transcript)
+        assert len(calls) == 2
+        assert (
+            _stamp(indexer, transcript)["index_version"] == indexer_module.INDEX_VERSION
+        )
+        indexer.index_conversation(transcript)
+        assert len(calls) == 2
+    finally:
+        indexer.close()
+
+
+def test_database_indexed_before_stamps_reparses_once(tmp_path, monkeypatch):
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
+    try:
+        indexer.index_conversation(transcript)
+        indexer.conn.execute(
+            "DELETE FROM transcript_files"
+        )  # rows from before the table existed
+        indexer.conn.commit()
+
+        indexer.index_conversation(transcript)  # parses once, nothing new, stamps
+        assert len(calls) == 2
+        assert _stamp(indexer, transcript)["outcome"] == "unchanged"
+        indexer.index_conversation(transcript)
+        assert len(calls) == 2
+    finally:
+        indexer.close()
 
 
 def test_search_output_survives_cp1252_stdout(tmp_path):

@@ -24,6 +24,11 @@ from conversation_search.core.summarization import (
 )
 
 
+# Bump when a parser starts emitting different messages for the same transcript;
+# every stamped file is re-parsed once the version no longer matches.
+INDEX_VERSION = 1
+
+
 class ConversationIndexer:
     def __init__(self, db_path: str = "~/.conversation-search/index.db", quiet: bool = False):
         self.db_path = Path(db_path).expanduser()
@@ -62,13 +67,6 @@ class ConversationIndexer:
                 print("  Migrated database: added is_meta_conversation column")
         except sqlite3.OperationalError:
             pass  # Column already exists
-
-        # Migration: file signature columns so unchanged files skip re-parsing
-        for column in ("file_mtime_ns INTEGER", "file_size INTEGER"):
-            try:
-                self.conn.execute(f"ALTER TABLE conversations ADD COLUMN {column}")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
 
         self.conn.commit()
 
@@ -493,18 +491,20 @@ class ConversationIndexer:
 
     def _is_unchanged_since_index(self, cursor, file_path: Path, signature: Tuple[int, int]) -> bool:
         cursor.execute(
-            "SELECT file_mtime_ns, file_size FROM conversations WHERE conversation_file = ?",
+            "SELECT file_mtime_ns, file_size, index_version FROM transcript_files WHERE path = ?",
             (str(file_path),)
         )
         row = cursor.fetchone()
-        return row is not None and (row["file_mtime_ns"], row["file_size"]) == signature
+        return row is not None and tuple(row) == (signature[0], signature[1], INDEX_VERSION)
 
-    def _stamp_file_signature(self, cursor, provider: str, session_id: str, file_path: Path, signature: Tuple[int, int]) -> None:
+    def _stamp_file(self, cursor, provider: str, file_path: Path, signature: Tuple[int, int], outcome: str) -> None:
+        """Record what this file content produced; every exit of index_conversation stamps so no unchanged file is parsed twice"""
         cursor.execute("""
-            UPDATE conversations
-            SET conversation_file = ?, file_mtime_ns = ?, file_size = ?
-            WHERE provider = ? AND session_id = ?
-        """, (str(file_path), signature[0], signature[1], provider, session_id))
+            INSERT OR REPLACE INTO transcript_files (
+                path, provider, file_mtime_ns, file_size, index_version, outcome
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (str(file_path), provider, signature[0], signature[1], INDEX_VERSION, outcome))
+        self.conn.commit()
 
     def index_conversation(
         self,
@@ -530,12 +530,14 @@ class ConversationIndexer:
         if not messages:
             if not self.quiet:
                 print(f"  No messages found in {file_path}")
+            self._stamp_file(cursor, provider, file_path, signature, "no-messages")
             return
 
         # Skip summarizer conversations
         if provider == "claude" and is_summarizer_conversation(file_path, messages):
             if not self.quiet:
                 print(f"  ⏭️  Skipping automated summarizer conversation")
+            self._stamp_file(cursor, provider, file_path, signature, "summarizer")
             return
 
         # Mark meta-conversations (search pairs)
@@ -556,6 +558,7 @@ class ConversationIndexer:
         if not session_id:
             if not self.quiet:
                 print(f"  No session_id found in {file_path}")
+            self._stamp_file(cursor, provider, file_path, signature, "no-session-id")
             return
 
         # Calculate depths
@@ -587,8 +590,7 @@ class ConversationIndexer:
             if not new_messages:
                 if not self.quiet:
                     print(f"  No new messages, skipping")
-                self._stamp_file_signature(cursor, provider, session_id, file_path, signature)
-                self.conn.commit()
+                self._stamp_file(cursor, provider, file_path, signature, "unchanged")
                 return
 
             if not self.quiet:
@@ -605,18 +607,12 @@ class ConversationIndexer:
                 SET last_message_at = ?,
                     message_count = ?,
                     leaf_message_uuid = ?,
-                    conversation_file = ?,
-                    file_mtime_ns = ?,
-                    file_size = ?,
                     indexed_at = CURRENT_TIMESTAMP
                 WHERE provider = ? AND session_id = ?
             """, (
                 all_messages[-1]['timestamp'],
                 len(existing_uuids) + len(new_messages),
                 conv_meta.get('leafUuid') if conv_meta else None,
-                str(file_path),
-                signature[0],
-                signature[1],
                 provider,
                 session_id
             ))
@@ -628,9 +624,8 @@ class ConversationIndexer:
                 INSERT INTO conversations (
                     provider, session_id, project_path, conversation_file,
                     root_message_uuid, leaf_message_uuid, conversation_summary,
-                    first_message_at, last_message_at, message_count,
-                    file_mtime_ns, file_size
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    first_message_at, last_message_at, message_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 provider,
                 session_id,
@@ -641,9 +636,7 @@ class ConversationIndexer:
                 conv_meta.get('summary', 'Untitled conversation') if conv_meta else None,
                 messages[0]['timestamp'],
                 messages[-1]['timestamp'],
-                len(messages),
-                signature[0],
-                signature[1]
+                len(messages)
             ))
 
         # Classify messages for tool noise filtering
@@ -652,11 +645,13 @@ class ConversationIndexer:
             if self.summarizer.is_tool_noise(message):
                 tool_noise_uuids.append(message['uuid'])
 
-        # Insert all messages in a single transaction
+        # Insert all messages in a single transaction. OR IGNORE: forked Codex
+        # rollouts and some Claude transcripts repeat a message id; the first
+        # copy wins instead of the whole file failing and never indexing.
         try:
             for message in messages:
                 cursor.execute("""
-                    INSERT INTO messages (
+                    INSERT OR IGNORE INTO messages (
                         provider, message_uuid, session_id, parent_uuid, is_sidechain,
                         depth, timestamp, message_type, project_path,
                         conversation_file, full_content, is_meta_conversation,
@@ -680,6 +675,7 @@ class ConversationIndexer:
 
             # Commit once at the end
             self.conn.commit()
+            self._stamp_file(cursor, provider, file_path, signature, "indexed")
 
             if tool_noise_uuids and not self.quiet:
                 print(f"  Marked {len(tool_noise_uuids)} messages as tool noise")
