@@ -512,9 +512,13 @@ class ConversationIndexer:
         self,
         file_path: Path,
         summarize: bool = True,
-        provider: str = "claude",
+        provider: Optional[str] = "claude",
     ):
-        """Index a single conversation file with batch summarization"""
+        """Index a single conversation file with batch summarization.
+
+        provider=None detects it from the file, after the unchanged check, so a
+        skipped file is never opened.
+        """
         if not self.quiet:
             print(f"Indexing: {file_path}")
 
@@ -525,6 +529,9 @@ class ConversationIndexer:
             if not self.quiet:
                 print(f"  Unchanged since last index, skipping")
             return
+
+        if provider is None:
+            provider = detect_transcript_provider(file_path)
 
         # Parse file
         conv_meta, messages = self.parse_conversation_file(file_path, provider=provider)
@@ -718,11 +725,7 @@ class ConversationIndexer:
             if not self.quiet:
                 print(f"\n[{i}/{len(files)}]")
             try:
-                provider = (
-                    providers[0]
-                    if len(providers) == 1
-                    else detect_transcript_provider(file_path)
-                )
+                provider = providers[0] if len(providers) == 1 else None
                 self.index_conversation(
                     file_path,
                     summarize=summarize,

@@ -318,6 +318,26 @@ def test_calculate_depth_handles_branches_duplicates_and_cycles(tmp_path):
         indexer.close()
 
 
+def test_skipped_file_is_not_opened_for_provider_detection(tmp_path, monkeypatch):
+    transcript, indexer, calls = _fresh(tmp_path, monkeypatch)
+    detections = []
+    real_detect = indexer_module.detect_transcript_provider
+    monkeypatch.setattr(
+        indexer_module,
+        "detect_transcript_provider",
+        lambda path: detections.append(path) or real_detect(path),
+    )
+    try:
+        indexer.index_conversation(transcript, provider=None)
+        indexer.index_conversation(transcript, provider=None)
+        assert calls == [transcript]
+        assert detections == [transcript]
+        assert _stamp(indexer, transcript)["outcome"] == "indexed"
+        assert indexer.conn.execute("SELECT provider FROM conversations").fetchone()[0] == "claude"
+    finally:
+        indexer.close()
+
+
 def test_search_output_survives_cp1252_stdout(tmp_path):
     transcript = tmp_path / "session.jsonl"
     _write_transcript(transcript, turns=4)

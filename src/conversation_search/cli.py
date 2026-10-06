@@ -8,10 +8,10 @@ import sys
 from datetime import datetime
 from importlib.metadata import version, PackageNotFoundError
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from conversation_search.core.indexer import ConversationIndexer
-from conversation_search.core.providers import detect_transcript_provider, get_provider
+from conversation_search.core.providers import get_provider
 from conversation_search.core.search import ConversationSearch, format_timestamp
 from conversation_search.core.session_miner import (
     add_mine_session_args,
@@ -34,8 +34,9 @@ def _selected_providers(args) -> tuple[str, ...]:
     return ("claude", "codex") if provider == "all" else (provider,)
 
 
-def _provider_for_path(path: Path, providers: tuple[str, ...]) -> str:
-    return providers[0] if len(providers) == 1 else detect_transcript_provider(path)
+def _provider_for_path(path: Path, providers: tuple[str, ...]) -> Optional[str]:
+    """None leaves detection to the indexer, which only opens files it has to parse"""
+    return providers[0] if len(providers) == 1 else None
 
 
 def _resume_command(provider: str, session_id: str) -> str:
